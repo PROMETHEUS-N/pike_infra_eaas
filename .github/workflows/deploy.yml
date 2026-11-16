@@ -845,7 +845,7 @@ jobs:
 
             Invoke-RbacAssignment `
               -Scope "subscription" `
-              -Template "modules/RBAC/RBAC_subscription.bicep" `
+              -Template "modules/access/rbac/RBAC_subscription.bicep" `
               -DeploymentScope "sub" `
               -Target "Subscription" `
               -Access $access `
@@ -888,7 +888,7 @@ jobs:
 
             Invoke-RbacAssignment `
               -Scope "resource-group" `
-              -Template "modules/RBAC/RBAC_resource_group.bicep" `
+              -Template "modules/access/rbac/RBAC_resource_group.bicep" `
               -DeploymentScope "group" `
               -Target $access.resourceGroupName `
               -Access $access
@@ -951,7 +951,7 @@ jobs:
 
             Invoke-RbacAssignment `
               -Scope "resource" `
-              -Template "modules/RBAC/RBAC_resource.bicep" `
+              -Template "modules/access/rbac/RBAC_resource.bicep" `
               -DeploymentScope "group" `
               -Target $access.resourceGroupName `
               -Access $access `
