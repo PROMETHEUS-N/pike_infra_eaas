@@ -10,7 +10,7 @@ permissions:
 jobs:
   prechecks:
     name: Bicep lint and input validation
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, X64, Windows]
     steps:
       - uses: actions/checkout@v4
       - name: Install or update Azure CLI from Microsoft
@@ -585,49 +585,7 @@ jobs:
             & $az deployment group what-if -g $x.resourceGroupName -f "modules/compute/vm.bicep" --parameters "@$f" "vmAdminPassword=$env:VM_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "VM What-If failed"; continue}
             & $az deployment group create -g $x.resourceGroupName -n "pike-vm-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/compute/vm.bicep" --parameters "@$f" "vmAdminPassword=$env:VM_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "VM deployment failed"; continue}
           }
-
-  # verify:
-  #   name: Final Azure Resource Verification
-  #   runs-on: [self-hosted, X64, Windows]
-  #   needs: [deploy-rg, deploy-nsg, deploy-route-table, deploy-vnet, deploy-subnet, deploy-keyvault, deploy-storage, deploy-sql, deploy-openai, deploy-vm]
-  #   if: always()
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: azure/login@v2
-  #       with:
-  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
-  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  #     - name: Check deployed resource provisioning states
-  #       shell: pwsh
-  #       env:
-  #         RG_RESULT: ${{ needs.deploy-rg.result }}
-  #         NSG_RESULT: ${{ needs.deploy-nsg.result }}
-  #         ROUTE_RESULT: ${{ needs.deploy-route-table.result }}
-  #         VNET_RESULT: ${{ needs.deploy-vnet.result }}
-  #         SUBNET_RESULT: ${{ needs.deploy-subnet.result }}
-  #         KV_RESULT: ${{ needs.deploy-keyvault.result }}
-  #         STORAGE_RESULT: ${{ needs.deploy-storage.result }}
-  #         SQL_RESULT: ${{ needs.deploy-sql.result }}
-  #         OPENAI_RESULT: ${{ needs.deploy-openai.result }}
-  #         VM_RESULT: ${{ needs.deploy-vm.result }}
-  #       run: |
-  #         $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
-  #         $jobs=[ordered]@{ResourceGroup=$env:RG_RESULT;NSG=$env:NSG_RESULT;RouteTable=$env:ROUTE_RESULT;VNet=$env:VNET_RESULT;Subnet=$env:SUBNET_RESULT;KeyVault=$env:KV_RESULT;Storage=$env:STORAGE_RESULT;SQL=$env:SQL_RESULT;OpenAI=$env:OPENAI_RESULT;VM=$env:VM_RESULT}
-  #         $jobs.GetEnumerator()|ForEach-Object{Write-Host "$($_.Key): $($_.Value)"}
-  #         if(@($jobs.Values|Where-Object{$_ -ne "success"}).Count -gt 0){Write-Warning "At least one deployment stage did not complete successfully."; continue}
-  #         foreach($x in @($cfg.landingZones.resourceGroups)){& $az group show -n $x.rgName --query name -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "Resource group verification failed: $($x.rgName)"; continue}}
-  #         foreach($x in @($cfg.landingZones.nsgs)){& $az network nsg show -g $x.resourceGroupName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "NSG verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.routeTables)){& $az network route-table show -g $x.resourceGroupName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "Route table verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.vnets)){& $az network vnet show -g $x.resourceGroupName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "VNet verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.subnets)){& $az network vnet subnet show -g $x.resourceGroupName --vnet-name $x.vnetName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "Subnet verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.keyVaults)){& $az keyvault show -g $x.resourceGroupName -n $x.name --query name -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "Key Vault verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.storageAccounts)){& $az storage account show -g $x.resourceGroupName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "Storage verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.sqlDatabases)){& $az sql db show -g $x.resourceGroupName -s $x.serverName -n $x.databaseName --query status -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "SQL verification failed: $($x.databaseName)"; continue}}
-  #         foreach($x in @($cfg.landingZones.openAiServices)){& $az cognitiveservices account show -g $x.resourceGroupName -n $x.name --query name -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "OpenAI verification failed: $($x.name)"; continue}}
-  #         foreach($x in @($cfg.landingZones.vms)){& $az vm show -g $x.resourceGroupName -n $x.name --query provisioningState -o tsv;if($LASTEXITCODE -ne 0){Write-Warning "VM verification failed: $($x.name)"; continue}}
-  #         Write-Host "All configured resources were verified."
-
+  
   deploy-rbac:
     name: Deploy RBAC assignments
     runs-on: [self-hosted, X64, Windows]
