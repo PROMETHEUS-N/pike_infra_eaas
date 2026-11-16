@@ -72,6 +72,8 @@ jobs:
           Write-Host "All $($files.Count) Bicep files passed compilation."
 
       - name: Install and run actionlint against all workflow YAML files
+        id: actionlint
+        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -147,4 +149,104 @@ jobs:
             }
           }
           Write-Host "input.json passed JSON parsing and root/resource collection structure checks."
+      - name: Install and run zizmor security analysis
+        id: zizmor
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/zizmorcore/zizmor/releases/latest" -Headers @{ "Accept"="application/vnd.github+json"; "User-Agent"="PIKE-validation" }
+          $asset = $release.assets | Where-Object { $_.name -eq "zizmor-x86_64-pc-windows-msvc.zip" } | Select-Object -First 1
+          if ($null -eq $asset) { throw "Windows x64 zizmor release asset not found." }
+          $zip = Join-Path $env:RUNNER_TEMP "zizmor.zip"
+          $dest = Join-Path $env:RUNNER_TEMP "zizmor"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $exe = Get-ChildItem $dest -Filter "zizmor.exe" -Recurse -File | Select-Object -First 1
+          if ($null -eq $exe) { throw "zizmor.exe was not found in release archive." }
+          $result = & $exe.FullName --format=json .github/workflows 2> (Join-Path $reportDir "zizmor-stderr.txt")
+          $code = $LASTEXITCODE
+          $result | Out-File (Join-Path $reportDir "zizmor.json") -Encoding utf8
+          "ExitCode=$code" | Set-Content (Join-Path $reportDir "zizmor-meta.txt")
+          "Version=$($release.tag_name)" | Add-Content (Join-Path $reportDir "zizmor-meta.txt")
+          if ($code -ne 0) { throw "zizmor returned exit code $code." }
+          Write-Host "zizmor analysis completed."
+
+      - name: Generate Excel validation report
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $z = @()
+          $zp = Join-Path $dir "zizmor.json"
+          if (Test-Path $zp) {
+            try { $z = @(Get-Content $zp -Raw | ConvertFrom-Json) } catch { $z = @() }
+          }
+          $zm = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
+          $zcode = if ($zm -match "ExitCode=0") { "PASS" } elseif ($zm) { "FAIL" } else { "NOT RUN" }
+          $zver = (($zm | Where-Object { $_ -like "Version=*" }) -replace "^Version=","")
+          $rows = @()
+          $rows += ,@("Check","Status","Version","Finding count")
+          $rows += ,@("actionlint","See workflow step outcome","Latest release","See Actions log")
+          $rows += ,@("zizmor",$zcode,$zver,[string]$z.Count)
+          $summary = $rows
+          $details = @()
+          $details += ,@("Audit","Severity","Confidence","File","Line","Finding")
+          foreach ($f in $z) {
+            $line = [string]$f.location.start_line
+            if (-not $line) { $line = [string]$f.location.row }
+            $details += ,@([string]$f.audit,[string]$f.severity,[string]$f.confidence,[string]$f.location.path,$line,[string]$f.title)
+          }
+          if ($details.Count -eq 1) { $details += ,@("No findings","","","","","No zizmor findings returned") }
+          Add-Type -AssemblyName System.IO.Compression
+          $path = Join-Path (Get-Location) "pike-workflow-validation-report.xlsx"
+          if (Test-Path $path) { Remove-Item $path -Force }
+          $fs = [IO.File]::Open($path,[IO.FileMode]::CreateNew)
+          $za = [IO.Compression.ZipArchive]::new($fs,[IO.Compression.ZipArchiveMode]::Create)
+          function Put($z,$n,$s) { $e=$z.CreateEntry($n); $w=[IO.StreamWriter]::new($e.Open(),[Text.UTF8Encoding]::new($false)); $w.Write($s); $w.Dispose() }
+          function XCol($n) { $s=""; while($n -gt 0){$n--; $s=[char](65+($n%26))+$s; $n=[math]::Floor($n/26)}; $s }
+          function XSheet($data) {
+            $b=[Text.StringBuilder]::new()
+            [void]$b.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+            for($r=0;$r -lt $data.Count;$r++){
+              [void]$b.Append("<row r="+[char]34+($r+1)+[char]34+">")
+              for($k=0;$k -lt $data[$r].Count;$k++){
+                $ref=(XCol ($k+1))+($r+1)
+                $v=[Security.SecurityElement]::Escape([string]$data[$r][$k])
+                [void]$b.Append("<c r="+[char]34+$ref+[char]34+" t="+[char]34+"inlineStr"+[char]34+"><is><t xml:space="+[char]34+"preserve"+[char]34+">"+$v+"</t></is></c>")
+              }
+              [void]$b.Append("</row>")
+            }
+            [void]$b.Append("</sheetData></worksheet>"); $b.ToString()
+          }
+          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+          Put $za "_rels/.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Zizmor" sheetId="2" r:id="rId2"/></sheets></workbook>'
+          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+          Put $za "xl/worksheets/sheet1.xml" (XSheet $summary)
+          Put $za "xl/worksheets/sheet2.xml" (XSheet $details)
+          $za.Dispose(); $fs.Dispose()
+          Write-Host "Created Excel report: $path"
+
+      - name: Upload Excel validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PIKE-Workflow-Validation-${{ github.run_id }}
+          path: pike-workflow-validation-report.xlsx
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce actionlint and zizmor results
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ steps.actionlint.outcome }}" -ne "success") { throw "actionlint validation failed." }
+          if ("${{ steps.zizmor.outcome }}" -ne "success") { throw "zizmor validation failed." }
+
           Write-Host "Note: detailed per-resource property validation requires a JSON Schema or dedicated validation rules."
