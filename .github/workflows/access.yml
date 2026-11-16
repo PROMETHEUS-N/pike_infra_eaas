@@ -44,8 +44,8 @@ jobs:
           $results = [System.Collections.Generic.List[object]]::new()
 
           function Add-Result {
-            param([string]$Type,[string]$Scope,[string]$Target,[string]$Principal,[string]$Role,[string]$Status,[string]$Id="",[string]$ErrorMessage="")
-            $results.Add([PSCustomObject]@{ AccessType=$Type; Scope=$Scope; Target=$Target; Principal=$Principal; Role=$Role; Status=$Status; RequestOrAssignmentId=$Id; Error=$ErrorMessage })
+            param([string]$Type,[string]$Scope,[string]$Target,[string]$Principal,[string]$Role,[string]$Status,[string]$Id="",[string]$ErrorMessage="",[string]$PrincipalType="",[string]$RequestType="",[string]$Duration="")
+            $results.Add([PSCustomObject]@{ AccessType=$Type; Scope=$Scope; Target=$Target; Principal=$Principal; PrincipalType=$PrincipalType; Role=$Role; RequestType=$RequestType; Duration=$Duration; Status=$Status; RequestOrAssignmentId=$Id; Error=$ErrorMessage })
           }
 
           function Get-Entries {
@@ -185,9 +185,9 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "PIM role eligibility request failed: $($response -join ' ')" }
               $responseObject = ($response -join "`n") | ConvertFrom-Json
               $requestResourceId = if ($responseObject.id) { [string]$responseObject.id } else { $requestId }
-              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "SUBMITTED" $requestResourceId
+              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "SUBMITTED" $requestResourceId "" ([string]$Entry.principalType) $requestType ([string]$schedule.duration)
             } catch {
-              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "FAILED" "" $_.Exception.Message
+              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "FAILED" "" $_.Exception.Message ([string]$Entry.principalType) ([string]$Entry.requestType) ([string]$Entry.schedule.duration)
               Write-Warning "PIM request failed: $($_.Exception.Message)"
             }
           }
@@ -239,8 +239,75 @@ jobs:
             Write-Host "No RBAC or PIM entries found in input.json. Access management is skipped."
           }
 
-          $resultFile = Join-Path $env:RUNNER_TEMP "pike-access-results.json"
-          $results | ConvertTo-Json -Depth 40 | Set-Content -Path $resultFile -Encoding utf8
+          # Build a genuine .xlsx workbook without installing Python packages or PowerShell modules.
+          # The workbook contains separate RBAC and PIM worksheets.
+          function ConvertTo-ExcelColumnName {
+            param([int]$Number)
+            $name = ""
+            while ($Number -gt 0) {
+              $remainder = ($Number - 1) % 26
+              $name = [char](65 + $remainder) + $name
+              $Number = [math]::Floor(($Number - 1) / 26)
+            }
+            return $name
+          }
+
+          function ConvertTo-WorksheetXml {
+            param([object[]]$Rows,[string[]]$Headers)
+            $builder = [System.Text.StringBuilder]::new()
+            [void]$builder.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+            [void]$builder.Append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
+            $allRows = [System.Collections.Generic.List[object]]::new()
+            $allRows.Add([object]$Headers)
+            foreach ($row in $Rows) {
+              $values = @()
+              foreach ($header in $Headers) { $values += [string]$row.$header }
+              $allRows.Add([object]$values)
+            }
+            for ($r = 0; $r -lt $allRows.Count; $r++) {
+              $rowNumber = $r + 1
+              [void]$builder.Append("<row r=`"$rowNumber`">")
+              $values = [object[]]$allRows[$r]
+              for ($col = 0; $col -lt $Headers.Count; $col++) {
+                $cellRef = "$(ConvertTo-ExcelColumnName ($col + 1))$rowNumber"
+                $value = [string]$values[$col]
+                $escaped = [System.Security.SecurityElement]::Escape($value)
+                [void]$builder.Append("<c r=`"$cellRef`" t=`"inlineStr`"><is><t xml:space=`"preserve`">$escaped</t></is></c>")
+              }
+              [void]$builder.Append('</row>')
+            }
+            [void]$builder.Append('</sheetData></worksheet>')
+            return $builder.ToString()
+          }
+
+          function Add-ZipTextEntry {
+            param($Archive,[string]$EntryName,[string]$Content)
+            $entry = $Archive.CreateEntry($EntryName)
+            $stream = $entry.Open()
+            try {
+              $writer = [System.IO.StreamWriter]::new($stream,[System.Text.UTF8Encoding]::new($false))
+              try { $writer.Write($Content) } finally { $writer.Dispose() }
+            } finally { $stream.Dispose() }
+          }
+
+          $columns = @("AccessType","Scope","Target","Principal","PrincipalType","Role","RequestType","Duration","Status","RequestOrAssignmentId","Error")
+          $rbacRows = @($results | Where-Object { $_.AccessType -eq "RBAC" })
+          $pimRows = @($results | Where-Object { $_.AccessType -eq "PIM" })
+          $resultFile = Join-Path $env:RUNNER_TEMP "pike-access-results.xlsx"
+          if (Test-Path -LiteralPath $resultFile) { Remove-Item -LiteralPath $resultFile -Force }
+          Add-Type -AssemblyName System.IO.Compression
+          $fileStream = [System.IO.File]::Open($resultFile,[System.IO.FileMode]::CreateNew)
+          try {
+            $archive = [System.IO.Compression.ZipArchive]::new($fileStream,[System.IO.Compression.ZipArchiveMode]::Create,$true)
+            try {
+              Add-ZipTextEntry $archive "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+              Add-ZipTextEntry $archive "_rels/.rels" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+              Add-ZipTextEntry $archive "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="RBAC" sheetId="1" r:id="rId1"/><sheet name="PIM" sheetId="2" r:id="rId2"/></sheets></workbook>'
+              Add-ZipTextEntry $archive "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+              Add-ZipTextEntry $archive "xl/worksheets/sheet1.xml" (ConvertTo-WorksheetXml $rbacRows $columns)
+              Add-ZipTextEntry $archive "xl/worksheets/sheet2.xml" (ConvertTo-WorksheetXml $pimRows $columns)
+            } finally { $archive.Dispose() }
+          } finally { $fileStream.Dispose() }
           $results | Format-Table AccessType, Scope, Target, Principal, Role, Status -AutoSize
           $failed = @($results | Where-Object { $_.Status -eq "FAILED" })
           Write-Host "Total access requests: $($results.Count); failed: $($failed.Count)"
@@ -251,6 +318,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PIKE-Access-Results-${{ github.run_id }}
-          path: ${{ runner.temp }}/pike-access-results.json
+          path: ${{ runner.temp }}/pike-access-results.xlsx
           if-no-files-found: warn
           retention-days: 30
