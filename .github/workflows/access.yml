@@ -156,7 +156,8 @@ jobs:
               $expiration = @{ type=$expirationType }
               if ($expirationType -eq "AfterDuration") {
                 $duration = [string]$schedule.duration
-                if ($duration -notmatch '^P(?=\d|T\d)(\d+Y)?(\d+M)?(\d+D)?(T(\d+H)?(\d+M)?(\d+S)?)?$') { throw "schedule.duration must be an ISO 8601 duration such as PT2H, P30D, or P1Y." }
+                $allowedDurations = @("PT1H","PT2H","PT3H","PT4H","PT5H","PT6H","PT8H","PT12H","PT24H","P1D","P7D","P30D","P90D","P180D","P365D","P1M","P3M","P6M","P12M","P1Y")
+                if ($duration -notin $allowedDurations) { throw "Unsupported PIM duration '$duration'. Allowed values: $($allowedDurations -join ', ')." }
                 $expiration.duration = $duration
               } elseif ($expirationType -eq "AfterDateTime") {
                 if ([string]::IsNullOrWhiteSpace([string]$schedule.endDateTime)) { throw "schedule.endDateTime is required for AfterDateTime." }
