@@ -1,4 +1,4 @@
-name: PIKE Repository Validation
+name: Validate-Workflows
 
 on:
   workflow_call:
