@@ -178,7 +178,7 @@ jobs:
                 $properties.targetRoleEligibilityScheduleId = [string]$Entry.targetRoleEligibilityScheduleId
               }
               $requestId = [guid]::NewGuid().ToString()
-              $uri = "https://management.azure.com$($scopeId)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/$requestId?api-version=2020-10-01-preview"
+              $uri = "https://management.azure.com$($scopeId)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/$requestId?api-version=2020-10-01"
               $body = @{ properties=$properties } | ConvertTo-Json -Depth 30 -Compress
               $response = & $az rest --method put --url $uri --headers "Content-Type=application/json" --body $body --output json 2>&1
               if ($LASTEXITCODE -ne 0) { throw "PIM role eligibility request failed: $($response -join ' ')" }
