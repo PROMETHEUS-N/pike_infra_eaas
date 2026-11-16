@@ -22,6 +22,7 @@
 - [🔐 Authentication and secrets](#-authentication-and-secrets)
 - [🔄 Deployment lifecycle](#-deployment-lifecycle)
 - [🧪 Validation and deployment behaviour](#-validation-and-deployment-behaviour)
+- [📦 GitHub Actions artifacts and validation reports](#-github-actions-artifacts-and-validation-reports)
 - [🏷️ Resource naming](#️-resource-naming)
 - [🛡️ Security and operational notes](#️-security-and-operational-notes)
 - [▶️ Running the workflow](#️-running-the-workflow)
@@ -416,6 +417,28 @@ The final resource verification job is present only as commented-out YAML. It is
 ### Existing-resource handling
 
 The VNet job checks whether the configured VNet already exists. If it does, the workflow skips the VNet template to avoid replacing existing subnet configuration. The subnet job then runs as a separate stage.
+
+---
+
+## 📦 GitHub Actions artifacts and validation reports
+
+The repository is configured to generate **two separate GitHub Actions artifacts**, each containing an Excel workbook with validation or access findings.
+
+| # | Artifact | Workflow | Excel file | Contents |
+|---:|---|---|---|---|
+| 1 | `PIKE-Validation-${{ github.run_id }}` | `.github/workflows/validate-workflows.yml` | `pike-validation-report.xlsx` | **YAML Validation** worksheet with actionlint and zizmor findings; **Bicep Validation** worksheet with findings reported separately for each `.bicep` file. |
+| 2 | `PIKE-Access-Results-${{ github.run_id }}` | `.github/workflows/access.yml` | `pike-access-results.xlsx` | Separate **RBAC** and **PIM** worksheets containing access request/assignment results and errors. |
+
+### Where to download the artifacts
+
+1. Open the repository's **Actions** tab.
+2. Select the relevant workflow run.
+3. Open the completed run summary.
+4. Find the **Artifacts** section and download the required report.
+
+Both artifact upload steps are configured with a **30-day retention period**.
+
+> **Note:** These are two artifact types defined by the workflows. A run produces an artifact only when its workflow reaches the corresponding upload step. The validation report is uploaded even when its validation checks fail, provided report generation succeeds.
 
 ---
 
