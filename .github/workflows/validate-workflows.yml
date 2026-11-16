@@ -97,9 +97,17 @@ jobs:
           $actionlint = Get-ChildItem -Path $extractPath -Filter "actionlint.exe" -File -Recurse | Select-Object -First 1
           if ($null -eq $actionlint) { throw "actionlint.exe was not found in the downloaded release." }
 
+          $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
           Write-Host "Running actionlint $($release.tag_name) against $($workflowFiles.Count) workflow file(s)."
-          & $actionlint.FullName @workflowFiles
-          if ($LASTEXITCODE -ne 0) { throw "actionlint reported one or more GitHub Actions workflow errors." }
+          $lintOutput = & $actionlint.FullName @workflowFiles 2>&1
+          $lintExit = $LASTEXITCODE
+          $lintOutput | Out-String | Set-Content (Join-Path $reportDir "actionlint.txt") -Encoding UTF8
+          "ExitCode=$lintExit" | Set-Content (Join-Path $reportDir "actionlint-meta.txt")
+          "Version=$($release.tag_name)" | Add-Content (Join-Path $reportDir "actionlint-meta.txt")
+          "Files=$($workflowFiles.Count)" | Add-Content (Join-Path $reportDir "actionlint-meta.txt")
+          if ($lintOutput) { $lintOutput | ForEach-Object { Write-Host $_ } }
+          if ($lintExit -ne 0) { throw "actionlint reported one or more GitHub Actions workflow errors." }
           Write-Host "All GitHub Actions workflow YAML files passed actionlint."
 
       - name: Validate input.json syntax and structure
@@ -182,6 +190,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $am = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
+          $al = Get-Content (Join-Path $dir "actionlint.txt") -Raw -ErrorAction SilentlyContinue
+          $acode = if ($am -match "ExitCode=0") { "PASS" } elseif ($am) { "FAIL" } else { "NOT RUN" }
+          $aver = (($am | Where-Object { $_ -like "Version=*" }) -replace "^Version=","")
+          $afiles = (($am | Where-Object { $_ -like "Files=*" }) -replace "^Files=","")
+          if ([string]::IsNullOrWhiteSpace($al)) { $al = "No diagnostics" }
           $z = @()
           $zp = Join-Path $dir "zizmor.json"
           if (Test-Path $zp) {
@@ -191,9 +205,9 @@ jobs:
           $zcode = if ($zm -match "ExitCode=0") { "PASS" } elseif ($zm) { "FAIL" } else { "NOT RUN" }
           $zver = (($zm | Where-Object { $_ -like "Version=*" }) -replace "^Version=","")
           $rows = @()
-          $rows += ,@("Check","Status","Version","Finding count")
-          $rows += ,@("actionlint","See workflow step outcome","Latest release","See Actions log")
-          $rows += ,@("zizmor",$zcode,$zver,[string]$z.Count)
+          $rows += ,@("Check","Status","Version","Files scanned","Findings / diagnostics")
+          $rows += ,@("actionlint",$acode,$aver,$afiles,$al)
+          $rows += ,@("zizmor",$zcode,$zver,".github/workflows",[string]$z.Count)
           $summary = $rows
           $details = @()
           $details += ,@("Audit","Severity","Confidence","File","Line","Finding")
@@ -224,12 +238,13 @@ jobs:
             }
             [void]$b.Append("</sheetData></worksheet>"); $b.ToString()
           }
-          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
           Put $za "_rels/.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
-          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Zizmor" sheetId="2" r:id="rId2"/></sheets></workbook>'
-          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Actionlint" sheetId="2" r:id="rId2"/><sheet name="Zizmor" sheetId="3" r:id="rId3"/></sheets></workbook>'
+          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>'
           Put $za "xl/worksheets/sheet1.xml" (XSheet $summary)
-          Put $za "xl/worksheets/sheet2.xml" (XSheet $details)
+          Put $za "xl/worksheets/sheet2.xml" (XSheet @(@("Tool","Status","Version","Files scanned","Diagnostics"),@("actionlint",$acode,$aver,$afiles,$al)))
+          Put $za "xl/worksheets/sheet3.xml" (XSheet $details)
           $za.Dispose(); $fs.Dispose()
           Write-Host "Created Excel report: $path"
 
