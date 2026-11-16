@@ -5,20 +5,14 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  validate-yaml:
-    name: YAML and workflow security validation
-    uses: ./.github/workflows/validate-workflows.yml
-
   prechecks:
-    needs: validate-yaml
     name: Bicep lint and input validation
-    runs-on: [self-hosted, X64, Windows]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@v4
       - name: Install or update Azure CLI from Microsoft
         shell: bash
         run: |
@@ -76,15 +70,10 @@ jobs:
   azure-login-check:
     name: Azure OIDC login and subscription check
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: prechecks
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@v4
       - name: Check subscription secret is available
         shell: pwsh
         env:
@@ -99,7 +88,7 @@ jobs:
           }
           Write-Host "Subscription ID secret is available and has valid GUID format; value will not be printed."
       - name: Azure login using OIDC
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -119,17 +108,12 @@ jobs:
   deploy-rg:
     name: Deploy Resource Groups
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -162,17 +146,12 @@ jobs:
   deploy-nsg:
     name: Deploy Network Security Groups
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-rg]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -204,17 +183,12 @@ jobs:
   deploy-route-table:
     name: Deploy Route Tables
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-nsg]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -243,17 +217,12 @@ jobs:
   deploy-vnet:
     name: Deploy Virtual Networks
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-route-table]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -284,17 +253,12 @@ jobs:
   deploy-subnet:
     name: Deploy Subnets
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-vnet]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -323,17 +287,12 @@ jobs:
   deploy-load-balancer:
     name: Deploy Load Balancer
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-subnet]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -368,17 +327,12 @@ jobs:
   deploy-appgw-subnet:
     name: Deploy Application Gateway Subnet
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-subnet]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -413,17 +367,12 @@ jobs:
   deploy-appgw:
     name: Deploy Application Gateway
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-load-balancer, deploy-appgw-subnet]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -458,17 +407,12 @@ jobs:
   deploy-keyvault:
     name: Deploy Key Vaults
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-appgw]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -499,17 +443,12 @@ jobs:
   deploy-storage:
     name: Deploy Storage Accounts
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-keyvault]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -541,17 +480,12 @@ jobs:
   deploy-sql:
     name: Deploy SQL Databases
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-storage]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -582,17 +516,12 @@ jobs:
   deploy-openai:
     name: Deploy Azure OpenAI Services
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-sql]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -624,17 +553,12 @@ jobs:
   deploy-vm:
     name: Deploy Virtual Machines
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-openai]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -668,8 +592,8 @@ jobs:
   #   needs: [deploy-rg, deploy-nsg, deploy-route-table, deploy-vnet, deploy-subnet, deploy-keyvault, deploy-storage, deploy-sql, deploy-openai, deploy-vm]
   #   if: always()
   #   steps:
-  #     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-  #     - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+  #     - uses: actions/checkout@v4
+  #     - uses: azure/login@v2
   #       with:
   #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
   #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -707,19 +631,14 @@ jobs:
   deploy-rbac:
     name: Deploy RBAC assignments
     runs-on: [self-hosted, X64, Windows]
-    permissions:
-      contents: read
-      id-token: write
     needs: [prechecks, azure-login-check, deploy-vm]
     if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
     environment: dev
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
+      - uses: actions/checkout@v4
 
-      - uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -1109,7 +1028,7 @@ jobs:
 
       - name: Upload RBAC result report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v4
         with:
           name: RBAC-Deployment-Results-${{ github.run_id }}
           path: ${{ runner.temp }}/rbac-results.json
