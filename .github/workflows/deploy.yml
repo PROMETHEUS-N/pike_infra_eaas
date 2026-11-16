@@ -10,7 +10,7 @@ permissions:
 jobs:
   prechecks:
     name: Repository validation (Bicep, workflows and input)
-    uses: ./.github/workflows/validation.yaml
+    uses: ./.github/workflows/validate-workflows.yml
 
   azure-login-check:
     name: Azure OIDC login and subscription check
