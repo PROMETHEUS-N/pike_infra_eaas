@@ -42,35 +42,48 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Bicep version verification failed." }
 
       - name: Build and lint every Bicep file
+        id: bicep
+        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
           $files = @(Get-ChildItem -Path . -Filter "*.bicep" -File -Recurse |
             Where-Object { $_.FullName -notmatch '[\\/](\.git|\.bicep-cache)[\\/]' } |
             Sort-Object FullName)
-          if ($files.Count -eq 0) { throw "No Bicep files were found in the repository." }
-
-          $failures = [System.Collections.Generic.List[string]]::new()
-          Write-Host "Found $($files.Count) Bicep file(s). Each file will be compiled and checked by the configured Bicep linter."
-          foreach ($file in $files) {
-            Write-Host "::group::Bicep validation: $($file.FullName)"
-            $output = & $az bicep build --file $file.FullName --stdout 2>&1
-            $exitCode = $LASTEXITCODE
-            if ($output) { $output | ForEach-Object { Write-Host $_ } }
-            if ($exitCode -ne 0) {
-              $failures.Add("$($file.FullName) (exit code $exitCode)")
-              Write-Error "Bicep build failed: $($file.FullName)" -ErrorAction Continue
-            } else {
-              Write-Host "PASS: $($file.FullName)"
+          $results = [System.Collections.Generic.List[object]]::new()
+          if ($files.Count -eq 0) {
+            $results.Add([pscustomobject]@{ File="(repository)"; Status="FAIL"; Diagnostic="No Bicep files were found." })
+          } else {
+            foreach ($file in $files) {
+              Write-Host "::group::Bicep validation: $($file.FullName)"
+              $output = & $az bicep build --file $file.FullName --stdout 2>&1
+              $exitCode = $LASTEXITCODE
+              $diagnostics = @($output | ForEach-Object { "$_" } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              if ($exitCode -ne 0) {
+                if ($diagnostics.Count -eq 0) { $diagnostics = @("Bicep build failed with exit code $exitCode and returned no diagnostic text.") }
+                foreach ($diagnostic in $diagnostics) {
+                  $results.Add([pscustomobject]@{ File=$file.FullName; Status="FAIL"; Diagnostic=$diagnostic })
+                  Write-Host $diagnostic
+                }
+              } else {
+                if ($diagnostics.Count -eq 0) { $diagnostics = @("Compilation and configured Bicep linter checks passed; no diagnostics returned.") }
+                foreach ($diagnostic in $diagnostics) {
+                  $results.Add([pscustomobject]@{ File=$file.FullName; Status="PASS"; Diagnostic=$diagnostic })
+                }
+              }
+              Write-Host "::endgroup::"
             }
-            Write-Host "::endgroup::"
           }
-          if ($failures.Count -gt 0) {
-            throw "Bicep validation failed for $($failures.Count) file(s): $($failures -join '; ')"
-          }
-          Write-Host "All $($files.Count) Bicep files passed compilation."
-
+          $results | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "bicep-findings.json") -Encoding UTF8
+          $failed = @($results | Where-Object Status -eq "FAIL").Count
+          "ExitCode=$([int]($failed -gt 0))" | Set-Content (Join-Path $reportDir "bicep-meta.txt")
+          "Files=$($files.Count)" | Add-Content (Join-Path $reportDir "bicep-meta.txt")
+          if ($failed -gt 0) { throw "Bicep validation reported $failed failing diagnostic(s)." }
+          Write-Host "All $($files.Count) Bicep files passed."
+  
       - name: Install and run actionlint against all workflow YAML files
         id: actionlint
         continue-on-error: true
@@ -190,35 +203,65 @@ jobs:
           $ErrorActionPreference = "Stop"
           $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+          # Worksheet 1: GitHub Actions YAML validation (actionlint + zizmor)
+          $yamlRows = [System.Collections.Generic.List[object]]::new()
+          $yamlRows.Add(@("Tool","Status","Severity / Audit","Workflow file","Line","Finding"))
           $am = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
-          $al = Get-Content (Join-Path $dir "actionlint.txt") -Raw -ErrorAction SilentlyContinue
+          $al = Get-Content (Join-Path $dir "actionlint.txt") -ErrorAction SilentlyContinue
           $acode = if ($am -match "ExitCode=0") { "PASS" } elseif ($am) { "FAIL" } else { "NOT RUN" }
-          $aver = (($am | Where-Object { $_ -like "Version=*" }) -replace "^Version=","")
-          $afiles = (($am | Where-Object { $_ -like "Files=*" }) -replace "^Files=","")
-          if ([string]::IsNullOrWhiteSpace($al)) { $al = "No diagnostics" }
-          $z = @()
-          $zp = Join-Path $dir "zizmor.json"
-          if (Test-Path $zp) {
-            try { $z = @(Get-Content $zp -Raw | ConvertFrom-Json) } catch { $z = @() }
+          if ($al) {
+            foreach ($diagnostic in $al) {
+              if (-not [string]::IsNullOrWhiteSpace($diagnostic)) {
+                $file = ""; $line = ""
+                if ($diagnostic -match '^(.+?):(\d+):') { $file = $Matches[1]; $line = $Matches[2] }
+                $yamlRows.Add(@("actionlint",$acode,"",$file,$line,$diagnostic))
+              }
+            }
+          } else {
+            $yamlRows.Add(@("actionlint",$acode,"","","",$(if ($acode -eq "PASS") { "No YAML workflow diagnostics." } else { "actionlint did not produce a diagnostics file." })))
           }
+
+          $zpath = Join-Path $dir "zizmor.json"
           $zm = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
           $zcode = if ($zm -match "ExitCode=0") { "PASS" } elseif ($zm) { "FAIL" } else { "NOT RUN" }
-          $zver = (($zm | Where-Object { $_ -like "Version=*" }) -replace "^Version=","")
-          $rows = @()
-          $rows += ,@("Check","Status","Version","Files scanned","Findings / diagnostics")
-          $rows += ,@("actionlint",$acode,$aver,$afiles,$al)
-          $rows += ,@("zizmor",$zcode,$zver,".github/workflows",[string]$z.Count)
-          $summary = $rows
-          $details = @()
-          $details += ,@("Audit","Severity","Confidence","File","Line","Finding")
-          foreach ($f in $z) {
-            $line = [string]$f.location.start_line
-            if (-not $line) { $line = [string]$f.location.row }
-            $details += ,@([string]$f.audit,[string]$f.severity,[string]$f.confidence,[string]$f.location.path,$line,[string]$f.title)
+          $zfindings = @()
+          if (Test-Path $zpath) {
+            try { $zfindings = @(Get-Content $zpath -Raw | ConvertFrom-Json) } catch {
+              $yamlRows.Add(@("zizmor","ERROR","","","","Could not parse zizmor JSON: $($_.Exception.Message)"))
+            }
           }
-          if ($details.Count -eq 1) { $details += ,@("No findings","","","","","No zizmor findings returned") }
+          if ($zfindings.Count -gt 0) {
+            foreach ($f in $zfindings) {
+              $loc = $f.location
+              $file = [string]$loc.path
+              $line = [string]$loc.start_line
+              if (-not $line) { $line = [string]$loc.row }
+              $yamlRows.Add(@("zizmor",$zcode,[string]$f.severity,[string]$file,$line,("Audit: " + [string]$f.audit + " | " + [string]$f.title)))
+            }
+          } else {
+            $yamlRows.Add(@("zizmor",$zcode,"","","",$(if ($zcode -eq "PASS") { "No zizmor findings returned." } else { "zizmor did not produce findings output." })))
+          }
+
+          # Worksheet 2: every discovered Bicep file and its compiler/linter diagnostics
+          $bicepRows = [System.Collections.Generic.List[object]]::new()
+          $bicepRows.Add(@("Bicep file","Status","Diagnostic"))
+          $bp = Join-Path $dir "bicep-findings.json"
+          if (Test-Path $bp) {
+            try {
+              $bfindings = @(Get-Content $bp -Raw | ConvertFrom-Json)
+              foreach ($f in $bfindings) {
+                $bicepRows.Add(@([string]$f.File,[string]$f.Status,[string]$f.Diagnostic))
+              }
+            } catch {
+              $bicepRows.Add(@("(report parsing)","ERROR","Could not parse Bicep findings JSON: $($_.Exception.Message)"))
+            }
+          } else {
+            $bicepRows.Add(@("(Bicep validation)","NOT RUN","Bicep validation did not produce a findings file."))
+          }
+
           Add-Type -AssemblyName System.IO.Compression
-          $path = Join-Path (Get-Location) "pike-workflow-validation-report.xlsx"
+          $path = Join-Path (Get-Location) "pike-validation-report.xlsx"
           if (Test-Path $path) { Remove-Item $path -Force }
           $fs = [IO.File]::Open($path,[IO.FileMode]::CreateNew)
           $za = [IO.Compression.ZipArchive]::new($fs,[IO.Compression.ZipArchiveMode]::Create)
@@ -238,30 +281,29 @@ jobs:
             }
             [void]$b.Append("</sheetData></worksheet>"); $b.ToString()
           }
-          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
           Put $za "_rels/.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
-          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Summary" sheetId="1" r:id="rId1"/><sheet name="Actionlint" sheetId="2" r:id="rId2"/><sheet name="Zizmor" sheetId="3" r:id="rId3"/></sheets></workbook>'
-          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>'
-          Put $za "xl/worksheets/sheet1.xml" (XSheet $summary)
-          Put $za "xl/worksheets/sheet2.xml" (XSheet @(@("Tool","Status","Version","Files scanned","Diagnostics"),@("actionlint",$acode,$aver,$afiles,$al)))
-          Put $za "xl/worksheets/sheet3.xml" (XSheet $details)
+          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="YAML Validation" sheetId="1" r:id="rId1"/><sheet name="Bicep Validation" sheetId="2" r:id="rId2"/></sheets></workbook>'
+          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
+          Put $za "xl/worksheets/sheet1.xml" (XSheet $yamlRows)
+          Put $za "xl/worksheets/sheet2.xml" (XSheet $bicepRows)
           $za.Dispose(); $fs.Dispose()
-          Write-Host "Created Excel report: $path"
+          Write-Host "Created Excel report with YAML Validation and Bicep Validation worksheets: $path"
 
       - name: Upload Excel validation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PIKE-Workflow-Validation-${{ github.run_id }}
-          path: pike-workflow-validation-report.xlsx
+          name: PIKE-Validation-${{ github.run_id }}
+          path: pike-validation-report.xlsx
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Enforce actionlint and zizmor results
+      - name: Enforce validation results
         if: always()
         shell: pwsh
         run: |
           if ("${{ steps.actionlint.outcome }}" -ne "success") { throw "actionlint validation failed." }
           if ("${{ steps.zizmor.outcome }}" -ne "success") { throw "zizmor validation failed." }
-
-          Write-Host "Note: detailed per-resource property validation requires a JSON Schema or dedicated validation rules."
+          if ("${{ steps.bicep.outcome }}" -ne "success") { throw "Bicep validation failed." }
+          Write-Host "All YAML and Bicep validations passed."
