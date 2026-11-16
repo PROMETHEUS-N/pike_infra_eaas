@@ -49,30 +49,46 @@ jobs:
           $ErrorActionPreference = "Stop"
           $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
           $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          $buildDir = Join-Path $reportDir "bicep-build"
           New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
           $files = @(Get-ChildItem -Path . -Filter "*.bicep" -File -Recurse |
             Where-Object { $_.FullName -notmatch '[\\/](\.git|\.bicep-cache)[\\/]' } |
             Sort-Object FullName)
           $results = [System.Collections.Generic.List[object]]::new()
           if ($files.Count -eq 0) {
-            $results.Add([pscustomobject]@{ File="(repository)"; Status="FAIL"; Diagnostic="No Bicep files were found." })
+            $results.Add([pscustomobject]@{ File="(repository)"; Status="FAIL"; Severity="Error"; Code=""; Line=""; Finding="No Bicep files were found." })
           } else {
+            $index = 0
             foreach ($file in $files) {
-              Write-Host "::group::Bicep validation: $($file.FullName)"
-              $output = & $az bicep build --file $file.FullName --stdout 2>&1
+              $index++
+              $relativePath = [IO.Path]::GetRelativePath((Get-Location).Path,$file.FullName)
+              $outFile = Join-Path $buildDir ("module-{0}.json" -f $index)
+              Write-Host "::group::Bicep validation: $relativePath"
+              # Use an output file, not --stdout, so the generated ARM JSON is not mistaken for diagnostics.
+              $output = & $az bicep build --file $file.FullName --outfile $outFile 2>&1
               $exitCode = $LASTEXITCODE
-              $diagnostics = @($output | ForEach-Object { "$_" } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-              if ($exitCode -ne 0) {
-                if ($diagnostics.Count -eq 0) { $diagnostics = @("Bicep build failed with exit code $exitCode and returned no diagnostic text.") }
-                foreach ($diagnostic in $diagnostics) {
-                  $results.Add([pscustomobject]@{ File=$file.FullName; Status="FAIL"; Diagnostic=$diagnostic })
-                  Write-Host $diagnostic
-                }
-              } else {
-                if ($diagnostics.Count -eq 0) { $diagnostics = @("Compilation and configured Bicep linter checks passed; no diagnostics returned.") }
-                foreach ($diagnostic in $diagnostics) {
-                  $results.Add([pscustomobject]@{ File=$file.FullName; Status="PASS"; Diagnostic=$diagnostic })
-                }
+              $diagnostics = @($output | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $matched = 0
+              foreach ($diagnostic in $diagnostics) {
+                # Bicep diagnostics commonly include a severity, BCP code and source location.
+                $severity = "Info"
+                if ($diagnostic -match '(?i)\b(error|failed)\b') { $severity = "Error" }
+                elseif ($diagnostic -match '(?i)\bwarning\b') { $severity = "Warning" }
+                $code = ""
+                if ($diagnostic -match '\b(BCP\d+)\b') { $code = $Matches[1] }
+                $line = ""
+                if ($diagnostic -match '\((\d+),(\d+)\)') { $line = $Matches[1] }
+                elseif ($diagnostic -match ':(\d+):(\d+)') { $line = $Matches[1] }
+                if ($exitCode -ne 0 -and $severity -eq "Info") { $severity = "Error" }
+                $status = if ($severity -eq "Error") { "FAIL" } elseif ($severity -eq "Warning") { "WARNING" } else { "INFO" }
+                $results.Add([pscustomobject]@{ File=$relativePath; Status=$status; Severity=$severity; Code=$code; Line=$line; Finding=$diagnostic })
+                $matched++
+              }
+              if ($exitCode -ne 0 -and $matched -eq 0) {
+                $results.Add([pscustomobject]@{ File=$relativePath; Status="FAIL"; Severity="Error"; Code=""; Line=""; Finding="Bicep build failed with exit code $exitCode and returned no diagnostic text." })
+              } elseif ($exitCode -eq 0 -and $matched -eq 0) {
+                $results.Add([pscustomobject]@{ File=$relativePath; Status="PASS"; Severity="None"; Code=""; Line=""; Finding="No findings. Bicep compilation completed successfully." })
               }
               Write-Host "::endgroup::"
             }
@@ -81,8 +97,8 @@ jobs:
           $failed = @($results | Where-Object Status -eq "FAIL").Count
           "ExitCode=$([int]($failed -gt 0))" | Set-Content (Join-Path $reportDir "bicep-meta.txt")
           "Files=$($files.Count)" | Add-Content (Join-Path $reportDir "bicep-meta.txt")
-          if ($failed -gt 0) { throw "Bicep validation reported $failed failing diagnostic(s)." }
-          Write-Host "All $($files.Count) Bicep files passed."
+          if ($failed -gt 0) { throw "Bicep validation reported $failed error finding(s)." }
+          Write-Host "Bicep validation completed for $($files.Count) file(s)."
   
       - name: Install and run actionlint against all workflow YAML files
         id: actionlint
@@ -245,19 +261,19 @@ jobs:
 
           # Worksheet 2: every discovered Bicep file and its compiler/linter diagnostics
           $bicepRows = [System.Collections.Generic.List[object]]::new()
-          $bicepRows.Add(@("Bicep file","Status","Diagnostic"))
+          $bicepRows.Add(@("Bicep file","Status","Severity","Rule / Code","Line","Finding"))
           $bp = Join-Path $dir "bicep-findings.json"
           if (Test-Path $bp) {
             try {
               $bfindings = @(Get-Content $bp -Raw | ConvertFrom-Json)
               foreach ($f in $bfindings) {
-                $bicepRows.Add(@([string]$f.File,[string]$f.Status,[string]$f.Diagnostic))
+                $bicepRows.Add(@([string]$f.File,[string]$f.Status,[string]$f.Severity,[string]$f.Code,[string]$f.Line,[string]$f.Finding))
               }
             } catch {
-              $bicepRows.Add(@("(report parsing)","ERROR","Could not parse Bicep findings JSON: $($_.Exception.Message)"))
+              $bicepRows.Add(@("(report parsing)","ERROR","Error","","","Could not parse Bicep findings JSON: $($_.Exception.Message)"))
             }
           } else {
-            $bicepRows.Add(@("(Bicep validation)","NOT RUN","Bicep validation did not produce a findings file."))
+            $bicepRows.Add(@("(Bicep validation)","NOT RUN","Info","","","Bicep validation did not produce a findings file."))
           }
 
           Add-Type -AssemblyName System.IO.Compression
