@@ -1,0 +1,68 @@
+name: PIKE Workflow Validation
+
+on:
+  # Run validation whenever workflow definitions change.
+  push:
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  # Allow the deployment workflow to call this as a reusable validation job.
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate-yaml:
+    name: YAML, GitHub Actions and Security Validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Validate YAML syntax and formatting in workflow files only.
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install yamllint
+        run: python -m pip install --disable-pip-version-check yamllint==1.37.1
+
+      - name: Validate YAML syntax
+        run: yamllint -d relaxed .github/workflows/
+
+      # Validate GitHub Actions-specific keys, expressions, dependencies,
+      # action inputs/outputs, runner labels and workflow syntax.
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="1.7.12"
+          ARCHIVE="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${ARCHIVE}" \
+            --output "${RUNNER_TEMP}/${ARCHIVE}"
+          tar -xzf "${RUNNER_TEMP}/${ARCHIVE}" -C "${RUNNER_TEMP}" actionlint
+          sudo install "${RUNNER_TEMP}/actionlint" /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Validate GitHub Actions workflows
+        run: actionlint -color
+
+      # Security scan is configured in non-SARIF mode so findings can fail
+      # this job and therefore block deployment. It scans only workflow files.
+      - name: Analyze workflow security with zizmor
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          version: 1.32.0
+          inputs: .github/workflows
+          advanced-security: false
+          annotations: true
