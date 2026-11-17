@@ -4,7 +4,7 @@
 **Workflow:** .github/workflows/deploy.yml  
 **Purpose:** Explain the deployment workflow, PowerShell logic, input/template paths, parameter generation, What-If previews, and Azure deployments.
 
-This document excludes the internal implementation of access.yml and validate-workflows.yml, which are documented separately.
+This document explains the deployment workflow and its integration with the reusable `validate-workflows.yml` and `access.yml` workflows. It summarizes their responsibilities and run-graph behavior; detailed implementation of validation and RBAC/PIM processing is maintained in their respective workflow documentation.
 
 ## 1. Overall execution flow
 
@@ -28,7 +28,7 @@ flowchart TD
  M --> N[SQL Databases]
  N --> O[Azure OpenAI]
  O --> P[Virtual Machines]
- P --> Q([Deployment chain ends])
+ P --> R[RBAC and PIM access management]\n R --> Q([Deployment chain ends])
  classDef start fill:#243b53,stroke:#102a43,color:#fff
  classDef check fill:#fff3bf,stroke:#e0a800,color:#3d2c00
  classDef network fill:#d0ebff,stroke:#1971c2,color:#102a43
@@ -502,30 +502,30 @@ Because `azure-login-check` has `needs: prechecks`, Azure authentication and the
 ### 9.2 Access management — access.yml
 
 **File:** `.github/workflows/access.yml`  
-**Trigger declared:** `workflow_call`  
-**Current status in deploy.yml:** the file is reusable, but it is **not currently called by deploy.yml**.
+**Invocation from deploy.yml:** the `access-management` job.  
+**Current status:** actively called as the final reusable-workflow job after the VM deployment job.
 
-The current `deploy.yml` jobs include `prechecks`, `azure-login-check` and the infrastructure deployment jobs. There is no job with `uses: ./.github/workflows/access.yml`. Therefore, the RBAC/PIM workflow will **not** appear as a job in a `deploy.yml` run today. Its code remains a separate repository file, and it must be invoked by a caller workflow to execute.
-
-If you want RBAC/PIM to appear in the same Actions run graph, add a reusable-workflow job to deploy.yml, for example:
+The current caller configuration is:
 
 ```yaml
 access-management:
-  name: Access Management (RBAC and PIM)
+  name: Final RBAC and PIM access management
+  needs: [prechecks, azure-login-check, deploy-vm]
+  if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
   uses: ./.github/workflows/access.yml
   with:
     environment: dev
   secrets: inherit
 ```
 
-To make the infrastructure wait until access processing finishes, add `access-management` to the `needs` list of `azure-login-check` (or to the first infrastructure gate, depending on the desired order). For example:
+Because `access.yml` declares `workflow_call`, GitHub runs it as a reusable workflow within the same `deploy.yml` workflow run. The Actions run graph displays the `access-management` caller job and lets you open the called workflow's nested jobs and logs. The source remains in `.github/workflows/access.yml`; it is not copied into `deploy.yml`.
 
-```yaml
-azure-login-check:
-  needs: [prechecks, access-management]
-```
+**Execution order and dependency behavior**
 
-The downstream infrastructure jobs already depend on `azure-login-check`, so this makes them wait for both prechecks and access management. A called reusable workflow is represented in the caller's Actions run; its nested job and step logs can be opened from the run graph. It does not copy the contents of access.yml into deploy.yml.
+- `access-management` waits for `prechecks`, `azure-login-check` and `deploy-vm` because they are listed under `needs`.
+- Its `if` condition uses `always()` and checks only that `prechecks` and `azure-login-check` succeeded.
+- It does **not** check `needs.deploy-vm.result == 'success'`. Therefore, access management can still run if the VM job fails or is skipped, provided the two prerequisite checks succeeded.
+- This is the current behavior, not a proposed future integration.
 
 **What access.yml currently does**
 
@@ -535,46 +535,35 @@ The downstream infrastructure jobs already depend on `azure-login-check`, so thi
 - Resolves a principal from `principalId` or looks it up using `principalEmail` and `principalType` (User, Group or ServicePrincipal).
 - Runs RBAC Bicep deployments for subscription, resource-group and supported resource scopes, with What-If before create.
 - Processes PIM requests from supported `pim` input shapes and submits role eligibility schedule requests through Azure Resource Manager REST.
-- Produces an access results workbook with separate RBAC and PIM worksheets. The workflow's remaining steps upload this workbook as an Actions artifact.
+- Produces an access results workbook with separate RBAC and PIM worksheets and uploads it as an Actions artifact.
 
-**Important execution detail:** each GitHub Actions job has an independent runner context. The Azure login performed by access.yml does not carry over to the deployment jobs, and the login in deploy.yml does not carry into access.yml. Each workflow/job that invokes Azure CLI must authenticate in its own execution context; access.yml already performs its own OIDC login.
+**Important execution detail:** each GitHub Actions job has an independent runner context. The Azure login performed by `access.yml` does not carry over to the deployment jobs, and the login in `deploy.yml` does not carry into `access.yml`. Each workflow/job that invokes Azure CLI must authenticate in its own execution context; `access.yml` performs its own OIDC login.
 
-**Current versus intended run graph**
+**Current deployment run graph**
 
 ```mermaid
 flowchart TD
- subgraph CURRENT["Current deploy.yml"]
-  A([Manual run]) --> B[prechecks: validate-workflows.yml]
-  B --> C[azure-login-check]
-  C --> D[Infrastructure deployment jobs]
- end
- subgraph OPTIONAL["After adding access-management reusable job"]
-  E([Manual run]) --> F[prechecks]
-  E --> G[access-management: access.yml]
-  F --> H[azure-login-check]
-  G --> H
-  H --> I[Infrastructure deployment jobs]
- end
- classDef current fill:#d0ebff,stroke:#1971c2,color:#102a43
- classDef optional fill:#d3f9d8,stroke:#2b8a3e,color:#12351b
- class A,B,C,D current
- class E,F,G,H,I optional
+ A([Manual run]) --> B[prechecks: validate-workflows.yml]
+ B --> C[azure-login-check]
+ C --> D[Infrastructure deployment chain]
+ D --> E[deploy-vm completes]
+ E --> F[access-management: access.yml]
+ F --> G([Workflow run ends])
+ classDef check fill:#fff3bf,stroke:#e0a800,color:#3d2c00
+ classDef infra fill:#d0ebff,stroke:#1971c2,color:#102a43
+ classDef access fill:#d3f9d8,stroke:#2b8a3e,color:#12351b
+ class A,G access
+ class B,C check
+ class D,E infra
+ class F access
 ```
 
-The optional snippet above is a recommended integration pattern, not a change already present in the current deploy.yml. Also note that access.yml records individual RBAC/PIM failures in its results workbook; verify whether its final job status is configured to fail when any access request fails before treating a successful reusable-workflow result as proof that every access request succeeded.
+The diagram shows dependency ordering, not a guarantee that every resource deployment succeeded. Because the access job's condition does not require `deploy-vm` to succeed, it can still start after a VM deployment failure. Also inspect the called workflow's final enforcement logic before treating a successful access-management job as proof that every individual RBAC/PIM request succeeded.
 
 ## 10. Out of scope
 
 - Full Bicep resource declarations and their complete parameter schemas.
 - A complete JSON Schema for input.json.
 - Detailed Azure RBAC/PIM role licensing, tenant configuration and permissions troubleshooting.
-
-Read this document with the individual module documentation and the separate validation/access workflow documentation for the full deployment picture.
-
-
-- Internal implementation of `validate-workflows.yml`.
-- Internal implementation of `access.yml` (RBAC/PIM).
-- Bicep resource declarations and their full parameter schemas.
-- The complete input.json schema.
 
 Read this document with the individual module documentation and the separate validation/access workflow documentation for the full deployment picture.
