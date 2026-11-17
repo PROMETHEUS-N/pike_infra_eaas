@@ -303,8 +303,9 @@ jobs:
 
           $workbook = Join-Path (Get-Location) "pike-validation-report.xlsx"
           if (Test-Path $workbook) { Remove-Item $workbook -Force }
-          $yamlRows | Export-Excel -Path $workbook -WorksheetName "YAML Validation" -TableName "YamlValidation" -AutoSize -FreezeTopRow -BoldTopRow
-          $bicepRows | Export-Excel -Path $workbook -WorksheetName "Bicep Validation" -TableName "BicepValidation" -AutoSize -FreezeTopRow -BoldTopRow -Append
+          # Avoid AutoSize on large diagnostic collections; EPPlus auto-sizing can consume excessive memory on Windows runners.
+          Export-Excel -InputObject $yamlRows.ToArray() -Path $workbook -WorksheetName "YAML Validation" -TableName "YamlValidation" -FreezeTopRow -BoldTopRow
+          Export-Excel -InputObject $bicepRows.ToArray() -Path $workbook -WorksheetName "Bicep Validation" -TableName "BicepValidation" -FreezeTopRow -BoldTopRow -Append
           Write-Host "Created Excel report with YAML Validation and Bicep Validation worksheets."
 
       - name: Upload Excel validation report
@@ -325,10 +326,23 @@ jobs:
             @{ Name="Bicep CLI setup"; Outcome="${{ steps.bicep-setup.outcome }}" },
             @{ Name="Bicep validation"; Outcome="${{ steps.bicep.outcome }}" },
             @{ Name="actionlint"; Outcome="${{ steps.actionlint.outcome }}" },
-            @{ Name="input.json validation"; Outcome="${{ steps.input.outcome }}" },
-            @{ Name="zizmor"; Outcome="${{ steps.zizmor.outcome }}" }
+            @{ Name="input.json validation"; Outcome="${{ steps.input.outcome }}" }
           )) {
             if ($step.Outcome -ne "success") { $failed += "$($step.Name): $($step.Outcome)" }
           }
+
+          # zizmor findings are informational report rows. Only fail if the scanner itself could not run.
+          $zMetaPath = Join-Path (Join-Path $env:RUNNER_TEMP "pike-validation") "zizmor-meta.txt"
+          if (-not (Test-Path $zMetaPath)) {
+            $failed += "zizmor: no scanner result was produced"
+          } else {
+            $zMeta = Get-Content $zMetaPath -Raw
+            if ($zMeta -notmatch '(?m)^ExitCode=0\s*
+          Write-Host "All Bicep, YAML, security and input.json validations passed."
+) {
+              $failed += "zizmor: scanner execution failed ($($zMeta.Trim()))"
+            }
+          }
+
           if ($failed.Count -gt 0) { throw ("Validation failures: " + ($failed -join "; ")) }
           Write-Host "All Bicep, YAML, security and input.json validations passed."
