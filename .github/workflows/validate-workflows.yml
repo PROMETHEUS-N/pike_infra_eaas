@@ -14,69 +14,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install or update Azure CLI
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installer = Join-Path $env:RUNNER_TEMP "AzureCLI.msi"
-          Invoke-WebRequest -Uri "https://aka.ms/installazurecliwindowsx64" -OutFile $installer
-          $process = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$installer`"", "/quiet", "/norestart") -Wait -PassThru
-          if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Azure CLI installation failed with exit code $($process.ExitCode)."
-          }
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
-          if (-not (Test-Path -LiteralPath $az)) { throw "Azure CLI was not found at the expected installation path." }
-          & $az version
-          if ($LASTEXITCODE -ne 0) { throw "Azure CLI verification failed." }
-
-      - name: Install or update Bicep CLI
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
-          & $az bicep install
-          if ($LASTEXITCODE -ne 0) { throw "Bicep installation failed." }
-          & $az bicep upgrade
-          if ($LASTEXITCODE -ne 0) { throw "Bicep upgrade failed." }
-          & $az bicep version
-          if ($LASTEXITCODE -ne 0) { throw "Bicep version verification failed." }
-
-      - name: Build and lint every Bicep file
-        id: bicep
+      # Bicep is a standalone compiler; validation does not require Azure CLI or Azure login.
+      - name: Install Bicep CLI
+        id: bicep-setup
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $bicep = Join-Path $env:RUNNER_TEMP "bicep.exe"
+          Invoke-WebRequest -Uri "https://github.com/Azure/bicep/releases/latest/download/bicep-win-x64.exe" -OutFile $bicep
+          if (-not (Test-Path -LiteralPath $bicep)) { throw "Bicep CLI download failed." }
+          "BICEP_CLI_PATH=$bicep" | Add-Content $env:GITHUB_ENV
+          & $bicep --version
+          if ($LASTEXITCODE -ne 0) { throw "Bicep CLI verification failed." }
+
+      - name: Build and lint every Bicep file
+        id: bicep
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
           $buildDir = Join-Path $reportDir "bicep-build"
-          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
           New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+          $results = [System.Collections.Generic.List[object]]::new()
           $files = @(Get-ChildItem -Path . -Filter "*.bicep" -File -Recurse |
             Where-Object { $_.FullName -notmatch '[\\/](\.git|\.bicep-cache)[\\/]' } |
             Sort-Object FullName)
-          $results = [System.Collections.Generic.List[object]]::new()
-          if ($files.Count -eq 0) {
+
+          if (-not $env:BICEP_CLI_PATH -or -not (Test-Path -LiteralPath $env:BICEP_CLI_PATH)) {
+            $results.Add([pscustomobject]@{ File="(repository)"; Status="FAIL"; Severity="Error"; Code=""; Line=""; Finding="Bicep CLI was not installed. See the Install Bicep CLI step." })
+          } elseif ($files.Count -eq 0) {
             $results.Add([pscustomobject]@{ File="(repository)"; Status="FAIL"; Severity="Error"; Code=""; Line=""; Finding="No Bicep files were found." })
           } else {
             $index = 0
             foreach ($file in $files) {
               $index++
-              $relativePath = [IO.Path]::GetRelativePath((Get-Location).Path,$file.FullName)
+              $relativePath = [IO.Path]::GetRelativePath((Get-Location).Path, $file.FullName)
               $outFile = Join-Path $buildDir ("module-{0}.json" -f $index)
               Write-Host "::group::Bicep validation: $relativePath"
-              # Use an output file, not --stdout, so the generated ARM JSON is not mistaken for diagnostics.
-              $output = & $az bicep build --file $file.FullName --outfile $outFile 2>&1
+              $output = & $env:BICEP_CLI_PATH build --file $file.FullName --outfile $outFile 2>&1
               $exitCode = $LASTEXITCODE
               $diagnostics = @($output | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
               $matched = 0
               foreach ($diagnostic in $diagnostics) {
-                # Bicep diagnostics commonly include a severity, BCP code and source location.
                 $severity = "Info"
                 if ($diagnostic -match '(?i)\b(error|failed)\b') { $severity = "Error" }
                 elseif ($diagnostic -match '(?i)\bwarning\b') { $severity = "Warning" }
-                $code = ""
-                if ($diagnostic -match '\b(BCP\d+)\b') { $code = $Matches[1] }
+                $code = if ($diagnostic -match '\b(BCP\d+)\b') { $Matches[1] } else { "" }
                 $line = ""
                 if ($diagnostic -match '\((\d+),(\d+)\)') { $line = $Matches[1] }
                 elseif ($diagnostic -match ':(\d+):(\d+)') { $line = $Matches[1] }
@@ -93,224 +79,220 @@ jobs:
               Write-Host "::endgroup::"
             }
           }
+
           $results | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "bicep-findings.json") -Encoding UTF8
           $failed = @($results | Where-Object Status -eq "FAIL").Count
-          "ExitCode=$([int]($failed -gt 0))" | Set-Content (Join-Path $reportDir "bicep-meta.txt")
-          "Files=$($files.Count)" | Add-Content (Join-Path $reportDir "bicep-meta.txt")
           if ($failed -gt 0) { throw "Bicep validation reported $failed error finding(s)." }
           Write-Host "Bicep validation completed for $($files.Count) file(s)."
-  
-      - name: Install and run actionlint against all workflow YAML files
+
+      - name: Install and run actionlint
         id: actionlint
+        if: always()
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $workflowFiles = @(Get-ChildItem -Path ".github/workflows" -File -Recurse |
-            Where-Object { $_.Extension -in @(".yml", ".yaml") } |
-            Sort-Object FullName | ForEach-Object { $_.FullName })
-          if ($workflowFiles.Count -eq 0) { throw "No workflow YAML files found under .github/workflows/." }
-
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rhysd/actionlint/releases/latest" -Headers @{
-            "Accept" = "application/vnd.github+json"
-            "User-Agent" = "PIKE-infrastructure-validation"
-          }
-          $asset = $release.assets | Where-Object { $_.name -match '^actionlint_.*_windows_amd64\.zip$' } | Select-Object -First 1
-          if ($null -eq $asset) { throw "Could not find the Windows AMD64 actionlint release asset." }
-
-          $zipPath = Join-Path $env:RUNNER_TEMP "actionlint.zip"
-          $extractPath = Join-Path $env:RUNNER_TEMP "actionlint"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
-          if (Test-Path -LiteralPath $extractPath) { Remove-Item -LiteralPath $extractPath -Recurse -Force }
-          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractPath -Force
-          $actionlint = Get-ChildItem -Path $extractPath -Filter "actionlint.exe" -File -Recurse | Select-Object -First 1
-          if ($null -eq $actionlint) { throw "actionlint.exe was not found in the downloaded release." }
-
           $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-          Write-Host "Running actionlint $($release.tag_name) against $($workflowFiles.Count) workflow file(s)."
-          $lintOutput = & $actionlint.FullName @workflowFiles 2>&1
-          $lintExit = $LASTEXITCODE
-          $lintOutput | Out-String | Set-Content (Join-Path $reportDir "actionlint.txt") -Encoding UTF8
-          "ExitCode=$lintExit" | Set-Content (Join-Path $reportDir "actionlint-meta.txt")
-          "Version=$($release.tag_name)" | Add-Content (Join-Path $reportDir "actionlint-meta.txt")
-          "Files=$($workflowFiles.Count)" | Add-Content (Join-Path $reportDir "actionlint-meta.txt")
-          if ($lintOutput) { $lintOutput | ForEach-Object { Write-Host $_ } }
-          if ($lintExit -ne 0) { throw "actionlint reported one or more GitHub Actions workflow errors." }
-          Write-Host "All GitHub Actions workflow YAML files passed actionlint."
-
-      - name: Validate input.json syntax and structure
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $inputPath = Join-Path (Get-Location) "input.json"
-          if (-not (Test-Path -LiteralPath $inputPath)) { throw "input.json was not found in the repository root." }
-
+          $outputFile = Join-Path $reportDir "actionlint.txt"
+          $metaFile = Join-Path $reportDir "actionlint-meta.txt"
           try {
-            $jsonText = Get-Content -LiteralPath $inputPath -Raw
-            $cfg = ConvertFrom-Json -InputObject $jsonText -ErrorAction Stop
+            $workflowFiles = @(Get-ChildItem ".github/workflows" -File -Recurse |
+              Where-Object { $_.Extension -in @(".yml", ".yaml") } |
+              Sort-Object FullName | ForEach-Object { $_.FullName })
+            if ($workflowFiles.Count -eq 0) { throw "No workflow YAML files found under .github/workflows/." }
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rhysd/actionlint/releases/latest" -Headers @{
+              Accept = "application/vnd.github+json"
+              "User-Agent" = "PIKE-infrastructure-validation"
+            }
+            $asset = $release.assets | Where-Object { $_.name -match '^actionlint_.*_windows_amd64\.zip$' } | Select-Object -First 1
+            if ($null -eq $asset) { throw "Windows AMD64 actionlint release asset not found." }
+            $zip = Join-Path $env:RUNNER_TEMP "actionlint.zip"
+            $dest = Join-Path $env:RUNNER_TEMP "actionlint"
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+            if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            $exe = Get-ChildItem $dest -Filter "actionlint.exe" -Recurse -File | Select-Object -First 1
+            if ($null -eq $exe) { throw "actionlint.exe was not found in the downloaded archive." }
+            $lintOutput = & $exe.FullName @workflowFiles 2>&1
+            $code = $LASTEXITCODE
+            $lintOutput | Out-String | Set-Content $outputFile -Encoding UTF8
+            "ExitCode=$code" | Set-Content $metaFile
+            "Version=$($release.tag_name)" | Add-Content $metaFile
+            "Files=$($workflowFiles.Count)" | Add-Content $metaFile
+            if ($lintOutput) { $lintOutput | ForEach-Object { Write-Host $_ } }
+            if ($code -ne 0) { throw "actionlint reported workflow YAML errors." }
           } catch {
-            throw "input.json is not valid JSON: $($_.Exception.Message)"
+            $_ | Out-String | Set-Content $outputFile -Encoding UTF8
+            "ExitCode=1" | Set-Content $metaFile
+            throw
           }
 
-          if ($null -eq $cfg -or $cfg -is [System.Array]) { throw "input.json root must be a JSON object." }
-          $environment = ([string]$cfg.environment).Trim().ToLowerInvariant()
-          if ([string]::IsNullOrWhiteSpace($environment)) { throw "input.json must contain a root-level environment." }
-          if ($environment -ne "dev") { throw "Expected environment 'dev' but found '$environment'." }
-          if ([string]::IsNullOrWhiteSpace([string]$cfg.location)) { throw "input.json must contain a non-empty root-level location." }
-          if ($null -eq $cfg.landingZones -or $cfg.landingZones -is [System.Array]) { throw "input.json must contain a landingZones object." }
-
-          $knownArrays = @(
-            "resourceGroups", "nsgs", "routeTables", "vnets", "subnets",
-            "loadBalancers", "applicationGatewaySubnets", "applicationGateways",
-            "vms", "storageAccounts", "keyVaults", "sqlDatabases", "openAiServices"
-          )
-          foreach ($name in $knownArrays) {
-            $property = $cfg.landingZones.PSObject.Properties[$name]
-            if ($null -ne $property -and $null -ne $property.Value -and $property.Value -isnot [System.Array]) {
-              throw "landingZones.$name must be an array when provided."
-            }
-            if ($null -ne $property -and $null -ne $property.Value) {
-              if (@($property.Value | Where-Object { $null -eq $_ }).Count -gt 0) {
-                throw "landingZones.$name contains a null entry."
-              }
-            }
-          }
-
-          if ($null -ne $cfg.rbac) {
-            foreach ($name in @("subscriptionAccess", "resourceGroupAccess", "resourceAccess")) {
-              $property = $cfg.rbac.PSObject.Properties[$name]
-              if ($null -ne $property -and $null -ne $property.Value -and $property.Value -isnot [System.Array]) {
-                throw "rbac.$name must be an array when provided."
-              }
-            }
-          }
-          Write-Host "input.json passed JSON parsing and root/resource collection structure checks."
-      - name: Install and run zizmor security analysis
-        id: zizmor
+      - name: Validate input.json
+        id: input
+        if: always()
         continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/zizmorcore/zizmor/releases/latest" -Headers @{ "Accept"="application/vnd.github+json"; "User-Agent"="PIKE-validation" }
-          $asset = $release.assets | Where-Object { $_.name -eq "zizmor-x86_64-pc-windows-msvc.zip" } | Select-Object -First 1
-          if ($null -eq $asset) { throw "Windows x64 zizmor release asset not found." }
-          $zip = Join-Path $env:RUNNER_TEMP "zizmor.zip"
-          $dest = Join-Path $env:RUNNER_TEMP "zizmor"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
-          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          $exe = Get-ChildItem $dest -Filter "zizmor.exe" -Recurse -File | Select-Object -First 1
-          if ($null -eq $exe) { throw "zizmor.exe was not found in release archive." }
-          $result = & $exe.FullName --format=json .github/workflows 2> (Join-Path $reportDir "zizmor-stderr.txt")
-          $code = $LASTEXITCODE
-          $result | Out-File (Join-Path $reportDir "zizmor.json") -Encoding utf8
-          "ExitCode=$code" | Set-Content (Join-Path $reportDir "zizmor-meta.txt")
-          "Version=$($release.tag_name)" | Add-Content (Join-Path $reportDir "zizmor-meta.txt")
-          if ($code -ne 0) { throw "zizmor returned exit code $code." }
-          Write-Host "zizmor analysis completed."
+          $result = [ordered]@{ Status="PASS"; Finding="input.json passed JSON parsing and structure checks." }
+          try {
+            $inputPath = Join-Path (Get-Location) "input.json"
+            if (-not (Test-Path -LiteralPath $inputPath)) { throw "input.json was not found in the repository root." }
+            $cfg = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            if ($null -eq $cfg -or $cfg -isnot [System.Collections.IDictionary]) { throw "input.json root must be a JSON object." }
+            $environment = ([string]$cfg.environment).Trim().ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($environment)) { throw "input.json must contain a root-level environment." }
+            if ($environment -ne "dev") { throw "Expected environment 'dev' but found '$environment'." }
+            if ([string]::IsNullOrWhiteSpace([string]$cfg.location)) { throw "input.json must contain a non-empty root-level location." }
+            if ($null -eq $cfg.landingZones -or $cfg.landingZones -isnot [System.Collections.IDictionary]) {
+              throw "input.json must contain a landingZones object."
+            }
+            $knownArrays = @("resourceGroups","nsgs","routeTables","vnets","subnets","loadBalancers","applicationGatewaySubnets","applicationGateways","vms","storageAccounts","keyVaults","sqlDatabases","openAiServices")
+            foreach ($name in $knownArrays) {
+              if ($cfg.landingZones.Contains($name) -and $null -ne $cfg.landingZones[$name]) {
+                if ($cfg.landingZones[$name] -isnot [array]) { throw "landingZones.$name must be an array when provided." }
+                if (@($cfg.landingZones[$name] | Where-Object { $null -eq $_ }).Count -gt 0) {
+                  throw "landingZones.$name contains a null entry."
+                }
+              }
+            }
+            if ($null -ne $cfg.rbac) {
+              if ($cfg.rbac -isnot [System.Collections.IDictionary]) { throw "rbac must be an object when provided." }
+              foreach ($name in @("subscriptionAccess","resourceGroupAccess","resourceAccess")) {
+                if ($cfg.rbac.Contains($name) -and $null -ne $cfg.rbac[$name] -and $cfg.rbac[$name] -isnot [array]) {
+                  throw "rbac.$name must be an array when provided."
+                }
+              }
+            }
+          } catch {
+            $result.Status = "FAIL"
+            $result.Finding = $_.Exception.Message
+            $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "input-validation.json") -Encoding UTF8
+            throw
+          }
+          $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "input-validation.json") -Encoding UTF8
+          Write-Host $result.Finding
+
+      - name: Install and run zizmor
+        id: zizmor
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
+          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+          $jsonPath = Join-Path $reportDir "zizmor.json"
+          $metaPath = Join-Path $reportDir "zizmor-meta.txt"
+          try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/zizmorcore/zizmor/releases/latest" -Headers @{
+              Accept = "application/vnd.github+json"
+              "User-Agent" = "PIKE-validation"
+            }
+            $asset = $release.assets | Where-Object { $_.name -eq "zizmor-x86_64-pc-windows-msvc.zip" } | Select-Object -First 1
+            if ($null -eq $asset) { throw "Windows x64 zizmor release asset not found." }
+            $zip = Join-Path $env:RUNNER_TEMP "zizmor.zip"
+            $dest = Join-Path $env:RUNNER_TEMP "zizmor"
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+            if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            $exe = Get-ChildItem $dest -Filter "zizmor.exe" -Recurse -File | Select-Object -First 1
+            if ($null -eq $exe) { throw "zizmor.exe was not found in the downloaded archive." }
+            $result = & $exe.FullName --format=json .github/workflows 2> (Join-Path $reportDir "zizmor-stderr.txt")
+            $code = $LASTEXITCODE
+            $result | Out-File $jsonPath -Encoding utf8
+            "ExitCode=$code" | Set-Content $metaPath
+            "Version=$($release.tag_name)" | Add-Content $metaPath
+            if ($code -ne 0) { throw "zizmor returned exit code $code." }
+          } catch {
+            if (-not (Test-Path $jsonPath)) { "[]" | Set-Content $jsonPath -Encoding UTF8 }
+            "ExitCode=1" | Set-Content $metaPath
+            throw
+          }
 
       - name: Generate Excel validation report
+        id: excel
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Install-Module -Name ImportExcel -Scope CurrentUser -Force -AllowClobber
+          Import-Module ImportExcel -ErrorAction Stop
 
-          # Worksheet 1: GitHub Actions YAML validation (actionlint + zizmor)
           $yamlRows = [System.Collections.Generic.List[object]]::new()
-          $yamlRows.Add(@("Tool","Status","Severity / Audit","Workflow file","Line","Finding"))
-          $am = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
-          $al = Get-Content (Join-Path $dir "actionlint.txt") -ErrorAction SilentlyContinue
-          $acode = if ($am -match "ExitCode=0") { "PASS" } elseif ($am) { "FAIL" } else { "NOT RUN" }
-          if ($al) {
-            foreach ($diagnostic in $al) {
-              if (-not [string]::IsNullOrWhiteSpace($diagnostic)) {
-                $file = ""; $line = ""
-                if ($diagnostic -match '^(.+?):(\d+):') { $file = $Matches[1]; $line = $Matches[2] }
-                $yamlRows.Add(@("actionlint",$acode,"",$file,$line,$diagnostic))
-              }
+          $actionMeta = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
+          $actionOutput = Get-Content (Join-Path $dir "actionlint.txt") -ErrorAction SilentlyContinue
+          $actionStatus = if ($actionMeta -match "ExitCode=0") { "PASS" } elseif ($actionMeta) { "FAIL" } else { "NOT RUN" }
+          if ($actionOutput) {
+            foreach ($line in $actionOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) {
+              $file = ""; $number = ""
+              if ($line -match '^(.+?):(\d+):') { $file = $Matches[1]; $number = $Matches[2] }
+              $yamlRows.Add([pscustomobject]@{ Tool="actionlint"; Status=$actionStatus; Severity=""; WorkflowFile=$file; Line=$number; Finding=$line })
             }
           } else {
-            $yamlRows.Add(@("actionlint",$acode,"","","",$(if ($acode -eq "PASS") { "No YAML workflow diagnostics." } else { "actionlint did not produce a diagnostics file." })))
+            $yamlRows.Add([pscustomobject]@{ Tool="actionlint"; Status=$actionStatus; Severity=""; WorkflowFile=""; Line=""; Finding="No diagnostics returned, or actionlint did not run." })
           }
 
-          $zpath = Join-Path $dir "zizmor.json"
-          $zm = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
-          $zcode = if ($zm -match "ExitCode=0") { "PASS" } elseif ($zm) { "FAIL" } else { "NOT RUN" }
-          $zfindings = @()
-          if (Test-Path $zpath) {
-            try { $zfindings = @(Get-Content $zpath -Raw | ConvertFrom-Json) } catch {
-              $yamlRows.Add(@("zizmor","ERROR","","","","Could not parse zizmor JSON: $($_.Exception.Message)"))
+          $zMeta = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
+          $zStatus = if ($zMeta -match "ExitCode=0") { "PASS" } elseif ($zMeta) { "FAIL" } else { "NOT RUN" }
+          $zPath = Join-Path $dir "zizmor.json"
+          $zFindings = @()
+          if (Test-Path $zPath) {
+            try { $zFindings = @(Get-Content $zPath -Raw | ConvertFrom-Json) } catch {
+              $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status="ERROR"; Severity=""; WorkflowFile=""; Line=""; Finding="Could not parse zizmor JSON: $($_.Exception.Message)" })
             }
           }
-          if ($zfindings.Count -gt 0) {
-            foreach ($f in $zfindings) {
-              $loc = $f.location
-              $file = [string]$loc.path
-              $line = [string]$loc.start_line
-              if (-not $line) { $line = [string]$loc.row }
-              $yamlRows.Add(@("zizmor",$zcode,[string]$f.severity,[string]$file,$line,("Audit: " + [string]$f.audit + " | " + [string]$f.title)))
+          if ($zFindings.Count -gt 0) {
+            foreach ($finding in $zFindings) {
+              $line = [string]$finding.location.start_line
+              if (-not $line) { $line = [string]$finding.location.row }
+              $yamlRows.Add([pscustomobject]@{
+                Tool="zizmor"; Status=$zStatus; Severity=[string]$finding.severity
+                WorkflowFile=[string]$finding.location.path; Line=$line
+                Finding=("Audit: " + [string]$finding.audit + " | " + [string]$finding.title)
+              })
             }
           } else {
-            $yamlRows.Add(@("zizmor",$zcode,"","","",$(if ($zcode -eq "PASS") { "No zizmor findings returned." } else { "zizmor did not produce findings output." })))
+            $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status=$zStatus; Severity=""; WorkflowFile=""; Line=""; Finding="No findings returned, or zizmor did not run." })
           }
 
-          # Worksheet 2: every discovered Bicep file and its compiler/linter diagnostics
+          $inputPath = Join-Path $dir "input-validation.json"
+          if (Test-Path $inputPath) {
+            $inputResult = Get-Content $inputPath -Raw | ConvertFrom-Json
+            $yamlRows.Add([pscustomobject]@{ Tool="input.json"; Status=$inputResult.Status; Severity=""; WorkflowFile="input.json"; Line=""; Finding=$inputResult.Finding })
+          } else {
+            $yamlRows.Add([pscustomobject]@{ Tool="input.json"; Status="NOT RUN"; Severity=""; WorkflowFile="input.json"; Line=""; Finding="input.json validation did not produce a result." })
+          }
+
           $bicepRows = [System.Collections.Generic.List[object]]::new()
-          $bicepRows.Add(@("Bicep file","Status","Severity","Rule / Code","Line","Finding"))
-          $bp = Join-Path $dir "bicep-findings.json"
-          if (Test-Path $bp) {
-            try {
-              $bfindings = @(Get-Content $bp -Raw | ConvertFrom-Json)
-              foreach ($f in $bfindings) {
-                $bicepRows.Add(@([string]$f.File,[string]$f.Status,[string]$f.Severity,[string]$f.Code,[string]$f.Line,[string]$f.Finding))
-              }
-            } catch {
-              $bicepRows.Add(@("(report parsing)","ERROR","Error","","","Could not parse Bicep findings JSON: $($_.Exception.Message)"))
+          $bicepPath = Join-Path $dir "bicep-findings.json"
+          if (Test-Path $bicepPath) {
+            foreach ($finding in @(Get-Content $bicepPath -Raw | ConvertFrom-Json)) {
+              $bicepRows.Add([pscustomobject]@{
+                BicepFile=$finding.File; Status=$finding.Status; Severity=$finding.Severity
+                RuleCode=$finding.Code; Line=$finding.Line; Finding=$finding.Finding
+              })
             }
           } else {
-            $bicepRows.Add(@("(Bicep validation)","NOT RUN","Info","","","Bicep validation did not produce a findings file."))
+            $bicepRows.Add([pscustomobject]@{ BicepFile="(repository)"; Status="NOT RUN"; Severity=""; RuleCode=""; Line=""; Finding="Bicep validation did not produce findings." })
           }
 
-          Add-Type -AssemblyName System.IO.Compression
-          $path = Join-Path (Get-Location) "pike-validation-report.xlsx"
-          if (Test-Path $path) { Remove-Item $path -Force }
-          $fs = [IO.File]::Open($path,[IO.FileMode]::CreateNew)
-          $za = [IO.Compression.ZipArchive]::new($fs,[IO.Compression.ZipArchiveMode]::Create)
-          function Put($z,$n,$s) { $e=$z.CreateEntry($n); $w=[IO.StreamWriter]::new($e.Open(),[Text.UTF8Encoding]::new($false)); $w.Write($s); $w.Dispose() }
-          function XCol($n) { $s=""; while($n -gt 0){$n--; $s=[char](65+($n%26))+$s; $n=[math]::Floor($n/26)}; $s }
-          function XSheet($data) {
-            $b=[Text.StringBuilder]::new()
-            [void]$b.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
-            for($r=0;$r -lt $data.Count;$r++){
-              [void]$b.Append("<row r="+[char]34+($r+1)+[char]34+">")
-              for($k=0;$k -lt $data[$r].Count;$k++){
-                $ref=(XCol ($k+1))+($r+1)
-                $v=[Security.SecurityElement]::Escape([string]$data[$r][$k])
-                [void]$b.Append("<c r="+[char]34+$ref+[char]34+" t="+[char]34+"inlineStr"+[char]34+"><is><t xml:space="+[char]34+"preserve"+[char]34+">"+$v+"</t></is></c>")
-              }
-              [void]$b.Append("</row>")
-            }
-            [void]$b.Append("</sheetData></worksheet>"); $b.ToString()
-          }
-          Put $za "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
-          Put $za "_rels/.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
-          Put $za "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="YAML Validation" sheetId="1" r:id="rId1"/><sheet name="Bicep Validation" sheetId="2" r:id="rId2"/></sheets></workbook>'
-          Put $za "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
-          Put $za "xl/worksheets/sheet1.xml" (XSheet $yamlRows)
-          Put $za "xl/worksheets/sheet2.xml" (XSheet $bicepRows)
-          $za.Dispose(); $fs.Dispose()
-          Write-Host "Created Excel report with YAML Validation and Bicep Validation worksheets: $path"
+          $workbook = Join-Path (Get-Location) "pike-validation-report.xlsx"
+          if (Test-Path $workbook) { Remove-Item $workbook -Force }
+          $yamlRows | Export-Excel -Path $workbook -WorksheetName "YAML Validation" -TableName "YamlValidation" -AutoSize -FreezeTopRow -BoldTopRow
+          $bicepRows | Export-Excel -Path $workbook -WorksheetName "Bicep Validation" -TableName "BicepValidation" -AutoSize -FreezeTopRow -BoldTopRow -Append
+          Write-Host "Created Excel report with YAML Validation and Bicep Validation worksheets."
 
       - name: Upload Excel validation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PIKE-Validation-${{ github.run_id }}
+          name: PIKE-Validation-\${{ github.run_id }}
           path: pike-validation-report.xlsx
           if-no-files-found: warn
           retention-days: 30
@@ -319,7 +301,14 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if ("${{ steps.actionlint.outcome }}" -ne "success") { throw "actionlint validation failed." }
-          if ("${{ steps.zizmor.outcome }}" -ne "success") { throw "zizmor validation failed." }
-          if ("${{ steps.bicep.outcome }}" -ne "success") { throw "Bicep validation failed." }
-          Write-Host "All YAML and Bicep validations passed."
+          $failed = @()
+          foreach ($step in @(
+            @{ Name="Bicep validation"; Outcome="\${{ steps.bicep.outcome }}" },
+            @{ Name="actionlint"; Outcome="\${{ steps.actionlint.outcome }}" },
+            @{ Name="input.json validation"; Outcome="\${{ steps.input.outcome }}" },
+            @{ Name="zizmor"; Outcome="\${{ steps.zizmor.outcome }}" }
+          )) {
+            if ($step.Outcome -ne "success") { $failed += "$($step.Name): $($step.Outcome)" }
+          }
+          if ($failed.Count -gt 0) { throw ("Validation failures: " + ($failed -join "; ")) }
+          Write-Host "All Bicep, YAML, security and input.json validations passed."
