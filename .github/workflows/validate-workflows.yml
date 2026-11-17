@@ -292,7 +292,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PIKE-Validation-\${{ github.run_id }}
+          name: PIKE-Validation-${{ github.run_id }}
           path: pike-validation-report.xlsx
           if-no-files-found: warn
           retention-days: 30
@@ -303,10 +303,11 @@ jobs:
         run: |
           $failed = @()
           foreach ($step in @(
-            @{ Name="Bicep validation"; Outcome="\${{ steps.bicep.outcome }}" },
-            @{ Name="actionlint"; Outcome="\${{ steps.actionlint.outcome }}" },
-            @{ Name="input.json validation"; Outcome="\${{ steps.input.outcome }}" },
-            @{ Name="zizmor"; Outcome="\${{ steps.zizmor.outcome }}" }
+            @{ Name="Bicep CLI setup"; Outcome="${{ steps.bicep-setup.outcome }}" },
+            @{ Name="Bicep validation"; Outcome="${{ steps.bicep.outcome }}" },
+            @{ Name="actionlint"; Outcome="${{ steps.actionlint.outcome }}" },
+            @{ Name="input.json validation"; Outcome="${{ steps.input.outcome }}" },
+            @{ Name="zizmor"; Outcome="${{ steps.zizmor.outcome }}" }
           )) {
             if ($step.Outcome -ne "success") { $failed += "$($step.Name): $($step.Outcome)" }
           }
