@@ -440,7 +440,137 @@ Use the relevant predecessor job name in each stage.
 | Deployment failed | ARM deployment returned a non-zero exit code. | Inspect deployment operations/error details in Azure and the preceding CLI output. |
 | Job is green but resource is missing | A warning/continue path may have skipped the resource. | Search logs for What-If failed, deployment failed, missing module or skip messages. |
 
-## 9. Out of scope
+## 9. Reusable workflow integration — access.yml and validate-workflows.yml
+
+The deployment workflow uses two reusable-workflow concepts differently. This distinction determines which jobs appear in the GitHub Actions run graph.
+
+### 9.1 Repository validation — validate-workflows.yml
+
+**File:** `.github/workflows/validate-workflows.yml`  
+**Invocation from deploy.yml:** the `prechecks` job.
+
+```yaml
+prechecks:
+  name: Repository validation (Bicep, workflows and input)
+  uses: ./.github/workflows/validate-workflows.yml
+```
+
+The validation workflow declares `on: workflow_call`, so it is reusable and is called as a job inside the `deploy.yml` run. In the Actions run graph, `prechecks` is visible as a reusable-workflow job. Opening it exposes the called workflow's validation job and steps/logs. The YAML source itself remains in the repository at `.github/workflows/validate-workflows.yml`.
+
+**What validate-workflows.yml currently checks**
+
+| Validation | Implementation | Coverage / limitation |
+|---|---|---|
+| Azure CLI setup | Downloads/installs Azure CLI and checks `az version`. | Confirms the CLI is available on the Windows runner. |
+| Bicep CLI setup | Installs/upgrades Bicep and checks `az bicep version`. | Prepares the compiler used by the next step. |
+| Bicep compilation and diagnostics | Recursively discovers every `*.bicep` file in the repository, excluding `.git` and `.bicep-cache`, then runs `az bicep build` for each file. | Checks each discovered file independently and records its relative path, status, severity, BCP code, line and diagnostic. This is compilation/diagnostic validation; it does not deploy the modules or prove that Azure runtime permissions and resource constraints will succeed. |
+| GitHub Actions YAML lint | Discovers all `.yml` and `.yaml` files under `.github/workflows` and runs actionlint against the discovered files. | Covers the workflow files in that directory, including deploy.yml, access.yml and validate-workflows.yml when present. |
+| input.json syntax and structural checks | Parses root `input.json`; checks root object, `environment == dev`, non-empty `location`, `landingZones` object, known landing-zone arrays, null array entries and RBAC collection types. | It is not a complete JSON Schema validation. It does not validate every required property, every nested property/type, all Bicep parameter compatibility, or the full PIM request structure. |
+| Workflow security analysis | Runs zizmor against `.github/workflows`. | Produces workflow security audit findings in JSON. |
+| Excel report | Builds `pike-validation-report.xlsx`. | Contains **YAML Validation** and **Bicep Validation** worksheets. The YAML sheet includes actionlint and zizmor results; the Bicep sheet lists findings per discovered Bicep file. |
+| Artifact upload | Uploads `pike-validation-report.xlsx` as `PIKE-Validation-${{ github.run_id }}`. | Retention is 30 days; download it from the run's Artifacts section. |
+
+The validation job uses `continue-on-error: true` for the Bicep, actionlint and zizmor steps so that report generation can still run and collect their findings. The final **Enforce validation results** step checks those step outcomes and fails the validation job if any of those three checks failed. The input.json validation step is not marked `continue-on-error`; a failure there stops the job before later steps can run, so the Excel report/artifact may not be generated for that run.
+
+**Validation flow**
+
+```mermaid
+flowchart TD
+ A([deploy.yml starts]) --> B[prechecks calls validate-workflows.yml]
+ B --> C[Install Azure CLI and Bicep]
+ C --> D[Compile every discovered Bicep file]
+ D --> E[Run actionlint on workflow YAML files]
+ E --> F[Validate input.json structure]
+ F --> G[Run zizmor security analysis]
+ G --> H[Generate Excel report]
+ H --> I[Upload PIKE validation artifact]
+ I --> J{Enforce Bicep, actionlint and zizmor results}
+ J -- All pass --> K([prechecks succeeds])
+ J -- Any fails --> L([prechecks fails])
+ classDef check fill:#fff3bf,stroke:#e0a800,color:#3d2c00
+ classDef process fill:#d0ebff,stroke:#1971c2,color:#102a43
+ classDef success fill:#d3f9d8,stroke:#2b8a3e,color:#12351b
+ classDef failure fill:#ffe3e3,stroke:#c92a2a,color:#5c1111
+ class B,C,D,E,F,G,H,I process
+ class J check
+ class K success
+ class L failure
+```
+
+Because `azure-login-check` has `needs: prechecks`, Azure authentication and the infrastructure jobs are gated by successful repository validation.
+
+### 9.2 Access management — access.yml
+
+**File:** `.github/workflows/access.yml`  
+**Trigger declared:** `workflow_call`  
+**Current status in deploy.yml:** the file is reusable, but it is **not currently called by deploy.yml**.
+
+The current `deploy.yml` jobs include `prechecks`, `azure-login-check` and the infrastructure deployment jobs. There is no job with `uses: ./.github/workflows/access.yml`. Therefore, the RBAC/PIM workflow will **not** appear as a job in a `deploy.yml` run today. Its code remains a separate repository file, and it must be invoked by a caller workflow to execute.
+
+If you want RBAC/PIM to appear in the same Actions run graph, add a reusable-workflow job to deploy.yml, for example:
+
+```yaml
+access-management:
+  name: Access Management (RBAC and PIM)
+  uses: ./.github/workflows/access.yml
+  with:
+    environment: dev
+  secrets: inherit
+```
+
+To make the infrastructure wait until access processing finishes, add `access-management` to the `needs` list of `azure-login-check` (or to the first infrastructure gate, depending on the desired order). For example:
+
+```yaml
+azure-login-check:
+  needs: [prechecks, access-management]
+```
+
+The downstream infrastructure jobs already depend on `azure-login-check`, so this makes them wait for both prechecks and access management. A called reusable workflow is represented in the caller's Actions run; its nested job and step logs can be opened from the run graph. It does not copy the contents of access.yml into deploy.yml.
+
+**What access.yml currently does**
+
+- Declares `workflow_call` and accepts an optional `environment` input, defaulting to `dev`.
+- Runs on the self-hosted Windows x64 runner, checks out the repository and authenticates to Azure using OIDC.
+- Reads root `input.json` and processes the RBAC arrays `rbac.subscriptionAccess`, `rbac.resourceGroupAccess` and `rbac.resourceAccess`.
+- Resolves a principal from `principalId` or looks it up using `principalEmail` and `principalType` (User, Group or ServicePrincipal).
+- Runs RBAC Bicep deployments for subscription, resource-group and supported resource scopes, with What-If before create.
+- Processes PIM requests from supported `pim` input shapes and submits role eligibility schedule requests through Azure Resource Manager REST.
+- Produces an access results workbook with separate RBAC and PIM worksheets. The workflow's remaining steps upload this workbook as an Actions artifact.
+
+**Important execution detail:** each GitHub Actions job has an independent runner context. The Azure login performed by access.yml does not carry over to the deployment jobs, and the login in deploy.yml does not carry into access.yml. Each workflow/job that invokes Azure CLI must authenticate in its own execution context; access.yml already performs its own OIDC login.
+
+**Current versus intended run graph**
+
+```mermaid
+flowchart TD
+ subgraph CURRENT["Current deploy.yml"]
+  A([Manual run]) --> B[prechecks: validate-workflows.yml]
+  B --> C[azure-login-check]
+  C --> D[Infrastructure deployment jobs]
+ end
+ subgraph OPTIONAL["After adding access-management reusable job"]
+  E([Manual run]) --> F[prechecks]
+  E --> G[access-management: access.yml]
+  F --> H[azure-login-check]
+  G --> H
+  H --> I[Infrastructure deployment jobs]
+ end
+ classDef current fill:#d0ebff,stroke:#1971c2,color:#102a43
+ classDef optional fill:#d3f9d8,stroke:#2b8a3e,color:#12351b
+ class A,B,C,D current
+ class E,F,G,H,I optional
+```
+
+The optional snippet above is a recommended integration pattern, not a change already present in the current deploy.yml. Also note that access.yml records individual RBAC/PIM failures in its results workbook; verify whether its final job status is configured to fail when any access request fails before treating a successful reusable-workflow result as proof that every access request succeeded.
+
+## 10. Out of scope
+
+- Full Bicep resource declarations and their complete parameter schemas.
+- A complete JSON Schema for input.json.
+- Detailed Azure RBAC/PIM role licensing, tenant configuration and permissions troubleshooting.
+
+Read this document with the individual module documentation and the separate validation/access workflow documentation for the full deployment picture.
+
 
 - Internal implementation of `validate-workflows.yml`.
 - Internal implementation of `access.yml` (RBAC/PIM).
