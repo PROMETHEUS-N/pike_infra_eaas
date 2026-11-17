@@ -44,7 +44,7 @@ jobs:
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           & $az account set --subscription $env:AZURE_SUBSCRIPTION_ID
           if ($LASTEXITCODE -ne 0) { throw "Could not select subscription." }
           & $az account show --query "{name:name,id:id,tenantId:tenantId}" -o json
@@ -67,7 +67,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
                     $template = "modules/RG/resourcegroup.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -104,7 +104,7 @@ jobs:
       - name: What-If and deploy NSGs
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"; $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $ErrorActionPreference = "Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
                     $template = "modules/networking/nsg.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -141,7 +141,7 @@ jobs:
       - name: What-If and deploy Route Tables
         shell: pwsh
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
                     $template = "modules/networking/routetable.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping routeTables; later deployment jobs will still run."
@@ -175,7 +175,7 @@ jobs:
       - name: What-If and deploy VNets safely
         shell: pwsh
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
                     $template = "modules/networking/vnet.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping vnets; later deployment jobs will still run."
@@ -211,7 +211,7 @@ jobs:
       - name: What-If and deploy Subnets
         shell: pwsh
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
                     $template = "modules/networking/subnet.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping subnets; later deployment jobs will still run."
@@ -246,7 +246,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
                     $template = "modules/loadbalancer/lb.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -286,7 +286,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
                     $template = "modules/networking/applicationGatewaySubnet.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -326,7 +326,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source
           $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
                     $template = "modules/networking/applicationGateway.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -367,7 +367,7 @@ jobs:
         env:
           DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json; $tenant=& $az account show --query tenantId -o tsv
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json; $tenant=& $az account show --query tenantId -o tsv
                     $template = "modules/security/keyvault.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping keyVaults; later deployment jobs will still run."
@@ -403,7 +403,7 @@ jobs:
         env:
           DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
           Write-Host "Configured Storage Account names: $((@($cfg.landingZones.storageAccounts) | ForEach-Object { $_.name }) -join ', ')"
                     $template = "modules/storage/storageAccount.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -440,7 +440,7 @@ jobs:
         env:
           SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
                     $template = "modules/database/sql.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping sqlDatabases; later deployment jobs will still run."
@@ -476,7 +476,7 @@ jobs:
         env:
           DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
           Write-Host "Configured Azure OpenAI names: $((@($cfg.landingZones.openAiServices) | ForEach-Object { $_.name }) -join ', ')"
                     $template = "modules/ai/openai.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
@@ -513,7 +513,7 @@ jobs:
         env:
           VM_ADMIN_PASSWORD: ${{ secrets.VM_ADMIN_PASSWORD }}
         run: |
-          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          $ErrorActionPreference="Stop"; $az = (Get-Command az -CommandType Application -ErrorAction Stop).Source; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
                     $template = "modules/compute/vm.bicep"
           if (-not (Test-Path -LiteralPath $template)) {
             Write-Warning "Module $template is missing. Skipping vms; later deployment jobs will still run."
