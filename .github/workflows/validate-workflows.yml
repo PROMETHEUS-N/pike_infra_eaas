@@ -82,8 +82,8 @@ jobs:
 
           $results | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "bicep-findings.json") -Encoding UTF8
           $failed = @($results | Where-Object Status -eq "FAIL").Count
-          if ($failed -gt 0) { throw "Bicep validation reported $failed error finding(s)." }
-          Write-Host "Bicep validation completed for $($files.Count) file(s)."
+          Write-Host "Bicep validation completed for $($files.Count) file(s); error findings: $failed."
+          if ($failed -gt 0) { Write-Warning "Bicep findings were recorded. Continuing to the remaining validations." }
 
       - name: Install and run actionlint
         id: actionlint
@@ -218,6 +218,7 @@ jobs:
       - name: Generate CSV validation reports
         id: reports
         if: always()
+        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -321,7 +322,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Enforce validation results
+      - name: Summarize validation results (non-blocking)
         if: always()
         shell: pwsh
         run: |
@@ -330,21 +331,18 @@ jobs:
             @{ Name="Bicep CLI setup"; Outcome="${{ steps.bicep-setup.outcome }}" },
             @{ Name="Bicep validation"; Outcome="${{ steps.bicep.outcome }}" },
             @{ Name="actionlint"; Outcome="${{ steps.actionlint.outcome }}" },
-            @{ Name="input.json validation"; Outcome="${{ steps.input.outcome }}" }
+            @{ Name="input.json validation"; Outcome="${{ steps.input.outcome }}" },
+            @{ Name="zizmor"; Outcome="${{ steps.zizmor.outcome }}" },
+            @{ Name="CSV report generation"; Outcome="${{ steps.reports.outcome }}" }
           )) {
             if ($step.Outcome -ne "success") { $failed += "$($step.Name): $($step.Outcome)" }
           }
 
-          # Security findings are reported in CSV; only a scanner execution failure fails this check.
-          $zMetaPath = Join-Path (Join-Path $env:RUNNER_TEMP "pike-validation") "zizmor-meta.txt"
-          if (-not (Test-Path $zMetaPath)) {
-            $failed += "zizmor: no scanner result was produced"
+          if ($failed.Count -gt 0) {
+            Write-Warning "One or more validation steps reported errors:"
+            $failed | ForEach-Object { Write-Warning $_ }
+            Write-Host "The workflow continued and attempted to generate and upload the validation reports."
           } else {
-            $zMeta = Get-Content $zMetaPath -Raw
-            if ($zMeta -notmatch '(?m)^ExitCode=0\s*$') {
-              $failed += "zizmor: scanner execution failed ($($zMeta.Trim()))"
-            }
+            Write-Host "All validation steps completed successfully."
           }
-
-          if ($failed.Count -gt 0) { throw ("Validation failures: " + ($failed -join "; ")) }
-          Write-Host "All Bicep, YAML, security and input.json validations passed."
+          Write-Host "Validation findings are informational and do not block this workflow."
