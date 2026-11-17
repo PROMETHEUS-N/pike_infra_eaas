@@ -224,7 +224,7 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-          # CSV output uses PowerShell built-ins; no Excel or ImportExcel installation is required.
+          # CSV output uses PowerShell built-in commands; no external reporting module is required.
           $yamlRows = [System.Collections.Generic.List[object]]::new()
           $actionMeta = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
           $actionOutput = Get-Content (Join-Path $dir "actionlint.txt") -ErrorAction SilentlyContinue
@@ -335,15 +335,13 @@ jobs:
             if ($step.Outcome -ne "success") { $failed += "$($step.Name): $($step.Outcome)" }
           }
 
-          # zizmor findings are informational report rows. Only fail if the scanner itself could not run.
+          # Security findings are reported in CSV; only a scanner execution failure fails this check.
           $zMetaPath = Join-Path (Join-Path $env:RUNNER_TEMP "pike-validation") "zizmor-meta.txt"
           if (-not (Test-Path $zMetaPath)) {
             $failed += "zizmor: no scanner result was produced"
           } else {
             $zMeta = Get-Content $zMetaPath -Raw
-            if ($zMeta -notmatch '(?m)^ExitCode=0\s*
-          Write-Host "All Bicep, YAML, security and input.json validations passed."
-) {
+            if ($zMeta -notmatch '(?m)^ExitCode=0\s*$') {
               $failed += "zizmor: scanner execution failed ($($zMeta.Trim()))"
             }
           }
