@@ -215,21 +215,21 @@ jobs:
             throw
           }
 
-      - name: Generate Excel validation report
-        id: excel
+      - name: Generate CSV validation reports
+        id: reports
         if: always()
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $dir = Join-Path $env:RUNNER_TEMP "pike-validation"
           New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          Install-Module -Name ImportExcel -Scope CurrentUser -Force -AllowClobber
-          Import-Module ImportExcel -ErrorAction Stop
 
+          # CSV output uses PowerShell built-ins; no Excel or ImportExcel installation is required.
           $yamlRows = [System.Collections.Generic.List[object]]::new()
           $actionMeta = Get-Content (Join-Path $dir "actionlint-meta.txt") -ErrorAction SilentlyContinue
           $actionOutput = Get-Content (Join-Path $dir "actionlint.txt") -ErrorAction SilentlyContinue
           $actionStatus = if ($actionMeta -match "ExitCode=0") { "PASS" } elseif ($actionMeta) { "FAIL" } else { "NOT RUN" }
+
           if ($actionOutput) {
             foreach ($line in $actionOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) {
               $file = ""; $number = ""
@@ -237,10 +237,10 @@ jobs:
               $yamlRows.Add([pscustomobject]@{ Tool="actionlint"; Status=$actionStatus; Severity=""; WorkflowFile=$file; Line=$number; Finding=$line })
             }
           } else {
-            $yamlRows.Add([pscustomobject]@{ Tool="actionlint"; Status=$actionStatus; Severity=""; WorkflowFile=""; Line=""; Finding="No diagnostics returned, or actionlint did not run." })
+            $message = if ($actionStatus -eq "PASS") { "No workflow YAML findings detected." } else { "No diagnostics returned, or actionlint did not run." }
+            $yamlRows.Add([pscustomobject]@{ Tool="actionlint"; Status=$actionStatus; Severity=""; WorkflowFile=""; Line=""; Finding=$message })
           }
 
-          $zMeta = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
           $zPath = Join-Path $dir "zizmor.json"
           $zFindings = @()
           $zParseOk = $false
@@ -252,6 +252,7 @@ jobs:
               $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status="ERROR"; Severity=""; WorkflowFile=""; Line=""; Finding="Could not parse zizmor JSON: $($_.Exception.Message)" })
             }
           }
+
           if ($zParseOk -and $zFindings.Count -gt 0) {
             foreach ($finding in $zFindings) {
               $locations = @($finding.locations)
@@ -301,19 +302,22 @@ jobs:
             $bicepRows.Add([pscustomobject]@{ BicepFile="(repository)"; Status="NOT RUN"; Severity=""; RuleCode=""; Line=""; Finding="Bicep validation did not produce findings." })
           }
 
-          $workbook = Join-Path (Get-Location) "pike-validation-report.xlsx"
-          if (Test-Path $workbook) { Remove-Item $workbook -Force }
-          # Avoid AutoSize on large diagnostic collections; EPPlus auto-sizing can consume excessive memory on Windows runners.
-          Export-Excel -InputObject $yamlRows.ToArray() -Path $workbook -WorksheetName "YAML Validation" -TableName "YamlValidation" -FreezeTopRow -BoldTopRow
-          Export-Excel -InputObject $bicepRows.ToArray() -Path $workbook -WorksheetName "Bicep Validation" -TableName "BicepValidation" -FreezeTopRow -BoldTopRow -Append
-          Write-Host "Created Excel report with YAML Validation and Bicep Validation worksheets."
+          $yamlCsv = Join-Path (Get-Location) "pike-yaml-validation.csv"
+          $bicepCsv = Join-Path (Get-Location) "pike-bicep-validation.csv"
+          $yamlRows.ToArray() | Export-Csv -LiteralPath $yamlCsv -NoTypeInformation -Encoding utf8
+          $bicepRows.ToArray() | Export-Csv -LiteralPath $bicepCsv -NoTypeInformation -Encoding utf8
 
-      - name: Upload Excel validation report
+          Write-Host "Created YAML/security/input report: $yamlCsv ($($yamlRows.Count) rows)"
+          Write-Host "Created Bicep report: $bicepCsv ($($bicepRows.Count) rows)"
+
+      - name: Upload CSV validation reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PIKE-Validation-${{ github.run_id }}
-          path: pike-validation-report.xlsx
+          name: PIKE-Validation-CSV-${{ github.run_id }}
+          path: |
+            pike-yaml-validation.csv
+            pike-bicep-validation.csv
           if-no-files-found: warn
           retention-days: 30
 
