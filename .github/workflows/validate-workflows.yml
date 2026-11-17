@@ -54,7 +54,7 @@ jobs:
               $relativePath = [IO.Path]::GetRelativePath((Get-Location).Path, $file.FullName)
               $outFile = Join-Path $buildDir ("module-{0}.json" -f $index)
               Write-Host "::group::Bicep validation: $relativePath"
-              $output = & $env:BICEP_CLI_PATH build --file $file.FullName --outfile $outFile 2>&1
+              $output = & $env:BICEP_CLI_PATH build "$($file.FullName)" --outfile $outFile 2>&1
               $exitCode = $LASTEXITCODE
               $diagnostics = @($output | ForEach-Object { "$_".Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
               $matched = 0
