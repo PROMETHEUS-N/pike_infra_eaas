@@ -201,12 +201,14 @@ jobs:
             Expand-Archive -Path $zip -DestinationPath $dest -Force
             $exe = Get-ChildItem $dest -Filter "zizmor.exe" -Recurse -File | Select-Object -First 1
             if ($null -eq $exe) { throw "zizmor.exe was not found in the downloaded archive." }
-            $result = & $exe.FullName --format=json .github/workflows 2> (Join-Path $reportDir "zizmor-stderr.txt")
+            # Findings are written to JSON but do not make the scan step fail.
+            # Real scanner/runtime errors still return a non-zero exit code.
+            $result = & $exe.FullName --no-exit-codes --format=json-v1 .github/workflows 2> (Join-Path $reportDir "zizmor-stderr.txt")
             $code = $LASTEXITCODE
             $result | Out-File $jsonPath -Encoding utf8
             "ExitCode=$code" | Set-Content $metaPath
             "Version=$($release.tag_name)" | Add-Content $metaPath
-            if ($code -ne 0) { throw "zizmor returned exit code $code." }
+            if ($code -ne 0) { throw "zizmor execution failed with exit code $code." }
           } catch {
             if (-not (Test-Path $jsonPath)) { "[]" | Set-Content $jsonPath -Encoding UTF8 }
             "ExitCode=1" | Set-Content $metaPath
@@ -239,26 +241,43 @@ jobs:
           }
 
           $zMeta = Get-Content (Join-Path $dir "zizmor-meta.txt") -ErrorAction SilentlyContinue
-          $zStatus = if ($zMeta -match "ExitCode=0") { "PASS" } elseif ($zMeta) { "FAIL" } else { "NOT RUN" }
           $zPath = Join-Path $dir "zizmor.json"
           $zFindings = @()
+          $zParseOk = $false
           if (Test-Path $zPath) {
-            try { $zFindings = @(Get-Content $zPath -Raw | ConvertFrom-Json) } catch {
+            try {
+              $zFindings = @(Get-Content $zPath -Raw | ConvertFrom-Json -ErrorAction Stop)
+              $zParseOk = $true
+            } catch {
               $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status="ERROR"; Severity=""; WorkflowFile=""; Line=""; Finding="Could not parse zizmor JSON: $($_.Exception.Message)" })
             }
           }
-          if ($zFindings.Count -gt 0) {
+          if ($zParseOk -and $zFindings.Count -gt 0) {
             foreach ($finding in $zFindings) {
-              $line = [string]$finding.location.start_line
-              if (-not $line) { $line = [string]$finding.location.row }
-              $yamlRows.Add([pscustomobject]@{
-                Tool="zizmor"; Status=$zStatus; Severity=[string]$finding.severity
-                WorkflowFile=[string]$finding.location.path; Line=$line
-                Finding=("Audit: " + [string]$finding.audit + " | " + [string]$finding.title)
-              })
+              $locations = @($finding.locations)
+              if ($locations.Count -eq 0) {
+                $yamlRows.Add([pscustomobject]@{
+                  Tool="zizmor"; Status="FINDING"; Severity=[string]$finding.determinations.severity
+                  WorkflowFile=""; Line=""
+                  Finding=("Audit: " + [string]$finding.ident + " | " + [string]$finding.desc)
+                })
+                continue
+              }
+              foreach ($location in $locations) {
+                $file = [string]$location.symbolic.key.Local.verbatim_path
+                $row = $location.concrete.location.start_point.row
+                $line = if ($null -ne $row) { [int]$row + 1 } else { "" }
+                $yamlRows.Add([pscustomobject]@{
+                  Tool="zizmor"; Status="FINDING"; Severity=[string]$finding.determinations.severity
+                  WorkflowFile=$file; Line=$line
+                  Finding=("Audit: " + [string]$finding.ident + " | " + [string]$finding.desc + " | " + [string]$finding.url)
+                })
+              }
             }
-          } else {
-            $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status=$zStatus; Severity=""; WorkflowFile=""; Line=""; Finding="No findings returned, or zizmor did not run." })
+          } elseif ($zParseOk) {
+            $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status="PASS"; Severity=""; WorkflowFile=""; Line=""; Finding="No security findings detected." })
+          } elseif (-not (Test-Path $zPath)) {
+            $yamlRows.Add([pscustomobject]@{ Tool="zizmor"; Status="NOT RUN"; Severity=""; WorkflowFile=""; Line=""; Finding="zizmor did not produce a report." })
           }
 
           $inputPath = Join-Path $dir "input-validation.json"
