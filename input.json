@@ -1,0 +1,97 @@
+{
+  "environment": "dev",
+  "location": "centralus",
+  "landingZones": {
+    "resourceGroups": [
+      {
+        "rgName": "rg-pikehex-dev-centralus-001",
+        "location": "centralus",
+        "tags": {
+          "Environment": "dev",
+          "Workload": "pikehex-cloud-migration",
+          "ManagedBy": "Bicep"
+        }
+      }
+    ],
+    "vnets": [
+      {
+        "name": "vnet-pikehex-dev-001",
+        "resourceGroupName": "rg-pikehex-dev-centralus-001",
+        "location": "centralus",
+        "addressPrefixes": [
+          "10.40.0.0/16"
+        ],
+        "dnsServers": [],
+        "tags": {
+          "Environment": "dev",
+          "Workload": "pikehex-cloud-migration",
+          "ManagedBy": "Bicep"
+        },
+        "subnets": []
+      }
+    ],
+    "subnets": [
+      {
+        "name": "snet-app-dev-001",
+        "vnetName": "vnet-pikehex-dev-001",
+        "resourceGroupName": "rg-pikehex-dev-centralus-001",
+        "addressPrefix": "10.40.1.0/24",
+        "networkSecurityGroupName": "nsg-pikehex-dev-001",
+        "routeTableName": "rt-pikehex-dev-001",
+        "serviceEndpoints": [],
+        "privateEndpointNetworkPolicies": "Enabled",
+        "privateLinkServiceNetworkPolicies": "Enabled"
+      }
+    ],
+    "nsgs": [
+      {
+        "name": "nsg-pikehex-dev-001",
+        "resourceGroupName": "rg-pikehex-dev-centralus-001",
+        "location": "centralus",
+        "tags": {
+          "Environment": "dev",
+          "Workload": "pikehex-cloud-migration",
+          "ManagedBy": "Bicep"
+        },
+        "securityRules": []
+      }
+    ],
+    "routeTables": [
+      {
+        "name": "rt-pikehex-dev-001",
+        "resourceGroupName": "rg-pikehex-dev-centralus-001",
+        "location": "centralus",
+        "disableBgpRoutePropagation": false,
+        "routes": [],
+        "tags": {
+          "Environment": "dev",
+          "Workload": "pikehex-cloud-migration",
+          "ManagedBy": "Bicep"
+        }
+      }
+    ],
+    "postgresqlServers": [
+      {
+        "serverName": "psql-pikehex-dev-centralus-161126",
+        "resourceGroupName": "rg-pikehex-dev-centralus-001",
+        "location": "centralus",
+        "administratorLogin": "pikehexpgadmin",
+        "version": "15",
+        "skuName": "Standard_D2ads_v5",
+        "skuTier": "GeneralPurpose",
+        "storageSizeGB": 32,
+        "backupRetentionDays": 7,
+        "vnetName": "vnet-pikehex-dev-001",
+        "subnetName": "snet-postgresql-dev-001",
+        "subnetAddressPrefix": "10.40.3.0/28",
+        "privateDnsZoneName": "privatelink.postgres.database.azure.com",
+        "privateDnsZoneLinkName": "vnet-pikehex-dev-postgresql-link",
+        "tags": {
+          "Environment": "dev",
+          "Workload": "pikehex-cloud-migration",
+          "ManagedBy": "Bicep"
+        }
+      }
+    ]
+  }
+}

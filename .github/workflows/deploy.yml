@@ -1,0 +1,659 @@
+name: PIKE Modular Azure Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prechecks:
+    name: Repository validation (Bicep, workflows and input)
+    uses: ./.github/workflows/validate-workflows.yml
+
+  azure-login-check:
+    name: Azure OIDC login and subscription check
+    runs-on: [self-hosted, X64, Windows]
+    needs: prechecks
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check subscription secret is available
+        shell: pwsh
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:AZURE_SUBSCRIPTION_ID)) {
+            throw "AZURE_SUBSCRIPTION_ID is empty or unavailable to this workflow."
+          }
+          if ($env:AZURE_SUBSCRIPTION_ID -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            throw "AZURE_SUBSCRIPTION_ID is not a valid GUID."
+          }
+          Write-Host "Subscription ID secret is available and has valid GUID format; value will not be printed."
+      - name: Azure login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify selected subscription
+        shell: pwsh
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          & $az account set --subscription $env:AZURE_SUBSCRIPTION_ID
+          if ($LASTEXITCODE -ne 0) { throw "Could not select subscription." }
+          & $az account show --query "{name:name,id:id,tenantId:tenantId}" -o json
+          if ($LASTEXITCODE -ne 0) { throw "Azure subscription verification failed." }
+
+  deploy-rg:
+    name: Deploy Resource Groups
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Resource Groups
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+                    $template = "modules/RG/resourcegroup.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping resourceGroups; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.resourceGroups | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No resourceGroups entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $p = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion='1.0.0.0'; parameters=@{ rgname=@{value=$x.rgName}; location=@{value=$x.location}; tags=@{value=$x.tags} } }
+            $p | ConvertTo-Json -Depth 100 | Set-Content "$env:RUNNER_TEMP\rg-params.json"
+            & $az deployment sub what-if --location $x.location --template-file "modules/RG/resourcegroup.bicep" --parameters "@$env:RUNNER_TEMP\rg-params.json"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Resource group What-If failed: $($x.rgName)"; continue }
+            & $az deployment sub create --name "pike-rg-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" --location $x.location --template-file "modules/RG/resourcegroup.bicep" --parameters "@$env:RUNNER_TEMP\rg-params.json"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Resource group deployment failed: $($x.rgName)"; continue }
+          }
+
+  deploy-nsg:
+    name: Deploy Network Security Groups
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-rg]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy NSGs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"; $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+                    $template = "modules/networking/nsg.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping nsgs; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.nsgs | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No nsgs entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v = @{location=$x.location;nsgName=$x.name;securityRules=@($x.securityRules);tags=$x.tags}
+            $p = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{} }
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}
+            $f="$env:RUNNER_TEMP\nsg.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/nsg.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "NSG What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-nsg-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/nsg.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "NSG deployment failed"; continue}
+          }
+
+  deploy-route-table:
+    name: Deploy Route Tables
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-nsg]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Route Tables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+                    $template = "modules/networking/routetable.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping routeTables; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.routeTables | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No routeTables entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{routeTableName=$x.name;location=$x.location;disableBgpRoutePropagation=$x.disableBgpRoutePropagation;routes=@($x.routes);tags=$x.tags}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\rt.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/routetable.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Route table What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-rt-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/routetable.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Route table deployment failed"; continue}
+          }
+
+  deploy-vnet:
+    name: Deploy Virtual Networks
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-route-table]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy VNets safely
+        shell: pwsh
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+                    $template = "modules/networking/vnet.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping vnets; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.vnets | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No vnets entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            & $az network vnet show -g $x.resourceGroupName -n $x.name --query name -o tsv 2>$null
+            if($LASTEXITCODE -eq 0){Write-Host "VNet $($x.name) already exists; skipping VNet template to avoid replacing existing subnet configuration."; continue}
+            $v=@{location=$x.location;vnetName=$x.name;addressPrefixes=@($x.addressPrefixes);tags=$x.tags;dnsServers=@($x.dnsServers);subnets=@()}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\vnet.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/vnet.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "VNet What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-vnet-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/vnet.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "VNet deployment failed"; continue}
+          }
+
+  deploy-subnet:
+    name: Deploy Subnets
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-vnet]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Subnets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+                    $template = "modules/networking/subnet.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping subnets; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.subnets | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No subnets entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{vnetName=$x.vnetName;subnetName=$x.name;addressPrefix=$x.addressPrefix;networkSecurityGroupName=$x.networkSecurityGroupName;routeTableName=$x.routeTableName;serviceEndpoints=@($x.serviceEndpoints);privateEndpointNetworkPolicies=$x.privateEndpointNetworkPolicies;privateLinkServiceNetworkPolicies=$x.privateLinkServiceNetworkPolicies}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\subnet.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/subnet.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Subnet What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-subnet-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/subnet.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Subnet deployment failed"; continue}
+          }
+
+  deploy-load-balancer:
+    name: Deploy Load Balancer
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-subnet]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Load Balancers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+                    $template = "modules/loadbalancer/lb.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping loadBalancers; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.loadBalancers | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No loadBalancers entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v = @{ loadBalancerName=$x.name; location=$x.location; skuName=$x.skuName; skuTier=$x.skuTier; tags=$x.tags; vnetName=$x.vnetName; subnetName=$x.subnetName; frontends=@($x.frontends); backendPools=@($x.backendPools); probes=@($x.probes); loadBalancingRules=@($x.loadBalancingRules) }
+            $p = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion='1.0.0.0'; parameters=@{} }
+            foreach ($k in $v.Keys) { $p.parameters[$k]=@{value=$v[$k]} }
+            $f="$env:RUNNER_TEMP\lb.json"; $p | ConvertTo-Json -Depth 100 | Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/loadbalancer/lb.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Load Balancer What-If failed: $($x.name)"; continue }
+            & $az deployment group create -g $x.resourceGroupName -n "pike-lb-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/loadbalancer/lb.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Load Balancer deployment failed: $($x.name)"; continue }
+          }
+
+  deploy-appgw-subnet:
+    name: Deploy Application Gateway Subnet
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-subnet]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Application Gateway Subnets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+                    $template = "modules/networking/applicationGatewaySubnet.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping applicationGatewaySubnets; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.applicationGatewaySubnets | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No applicationGatewaySubnets entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v = @{ vnetName=$x.vnetName; subnetName=$x.subnetName; subnetAddressPrefix=$x.subnetAddressPrefix }
+            $p = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion='1.0.0.0'; parameters=@{} }
+            foreach ($k in $v.Keys) { $p.parameters[$k]=@{value=$v[$k]} }
+            $f="$env:RUNNER_TEMP\appgw-subnet.json"; $p | ConvertTo-Json -Depth 100 | Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/applicationGatewaySubnet.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Application Gateway subnet What-If failed: $($x.subnetName)"; continue }
+            & $az deployment group create -g $x.resourceGroupName -n "pike-appgw-subnet-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/applicationGatewaySubnet.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Application Gateway subnet deployment failed: $($x.subnetName)"; continue }
+          }
+
+  deploy-appgw:
+    name: Deploy Application Gateway
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-load-balancer, deploy-appgw-subnet]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Application Gateways
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+                    $template = "modules/networking/applicationGateway.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping applicationGateways; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.applicationGateways | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No applicationGateways entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v = @{ applicationGatewayName=$x.applicationGatewayName; location=$x.location; vnetName=$x.vnetName; subnetName=$x.subnetName; publicIpName=$x.publicIpName; privateFrontendIp=$x.privateFrontendIp; minCapacity=$x.minCapacity; maxCapacity=$x.maxCapacity; frontendPorts=@($x.frontendPorts); backendPools=@($x.backendPools); backendHttpSettings=@($x.backendHttpSettings); healthProbes=@($x.healthProbes); listeners=@($x.listeners); routingRules=@($x.routingRules); enableHttp2=$x.enableHttp2; tags=$x.tags }
+            $p = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion='1.0.0.0'; parameters=@{} }
+            foreach ($k in $v.Keys) { $p.parameters[$k]=@{value=$v[$k]} }
+            $f="$env:RUNNER_TEMP\appgw.json"; $p | ConvertTo-Json -Depth 100 | Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/networking/applicationGateway.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Application Gateway What-If failed: $($x.applicationGatewayName)"; continue }
+            & $az deployment group create -g $x.resourceGroupName -n "pike-appgw-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/networking/applicationGateway.bicep" --parameters "@$f"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Application Gateway deployment failed: $($x.applicationGatewayName)"; continue }
+          }
+
+  deploy-keyvault:
+    name: Deploy Key Vaults
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-appgw]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Key Vaults
+        shell: pwsh
+        env:
+          DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json; $tenant=& $az account show --query tenantId -o tsv
+                    $template = "modules/security/keyvault.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping keyVaults; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.keyVaults | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No keyVaults entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{keyVaultName=$x.name;deploymentSuffix=$env:DEPLOYMENT_SUFFIX;location=$x.location;tenantId=$tenant;skuName=$x.skuName;skuFamily=$x.skuFamily;enableRbacAuthorization=$x.enableRbacAuthorization;enablePurgeProtection=$x.enablePurgeProtection;softDeleteRetentionInDays=$x.softDeleteRetentionInDays;publicNetworkAccess=$x.publicNetworkAccess;tags=$x.tags}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\kv.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/security/keyvault.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Key Vault What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-kv-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/security/keyvault.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Key Vault deployment failed"; continue}
+          }
+
+  deploy-storage:
+    name: Deploy Storage Accounts
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-keyvault]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Storage Accounts
+        shell: pwsh
+        env:
+          DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          Write-Host "Configured Storage Account names: $((@($cfg.landingZones.storageAccounts) | ForEach-Object { $_.name }) -join ', ')"
+                    $template = "modules/storage/storageAccount.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping storageAccounts; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.storageAccounts | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No storageAccounts entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{storageAccountName=$x.name;deploymentSuffix=$env:DEPLOYMENT_SUFFIX;location=$x.location;tags=$x.tags;skuName=$x.skuName;kind=$x.kind;accessTier=$x.accessTier;minimumTlsVersion=$x.minimumTlsVersion;supportsHttpsTrafficOnly=$x.supportsHttpsTrafficOnly;allowBlobPublicAccess=$x.allowBlobPublicAccess;allowSharedKeyAccess=$x.allowSharedKeyAccess;publicNetworkAccess=$x.publicNetworkAccess;containerNames=@($x.containerNames);blobServiceName=$x.blobServiceName;containerPublicAccess=$x.containerPublicAccess}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\storage.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/storage/storageAccount.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Storage What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-storage-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/storage/storageAccount.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "Storage deployment failed"; continue}
+          }
+
+  deploy-postgresql:
+    name: Deploy PostgreSQL Flexible Servers
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-vm]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-If and deploy PostgreSQL Flexible Servers
+        shell: pwsh
+        env:
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $az = "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd"
+          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
+          $template = "modules/database/postgresql/postgresql.bicep"
+
+          if (-not (Test-Path -LiteralPath $template)) {
+            throw "PostgreSQL Bicep module was not found: $template"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:POSTGRES_ADMIN_PASSWORD)) {
+            throw "GitHub secret POSTGRES_ADMIN_PASSWORD is required."
+          }
+
+          $items = @($cfg.landingZones.postgresqlServers | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No PostgreSQL servers configured. Skipping deployment."
+            return
+          }
+
+          foreach ($x in $items) {
+            $parameterFile = $null
+            try {
+              foreach ($required in @("serverName", "resourceGroupName", "location", "administratorLogin", "version", "skuName", "skuTier", "storageSizeGB", "backupRetentionDays", "vnetName", "subnetName", "subnetAddressPrefix", "privateDnsZoneName", "privateDnsZoneLinkName")) {
+                if ([string]::IsNullOrWhiteSpace([string]$x.$required)) {
+                  throw "Required PostgreSQL input '$required' is missing for server '$($x.serverName)'."
+                }
+              }
+
+              $vnetJson = & $az network vnet show --resource-group $x.resourceGroupName --name $x.vnetName --output json 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                throw "VNet '$($x.vnetName)' was not found in resource group '$($x.resourceGroupName)'."
+              }
+
+              $vnet = ($vnetJson -join "`n") | ConvertFrom-Json
+              if ($vnet.location -ne $x.location) {
+                throw "PostgreSQL location '$($x.location)' must match VNet location '$($vnet.location)'."
+              }
+
+              $parameters = @{
+                '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
+                contentVersion = '1.0.0.0'
+                parameters = @{
+                  serverName = @{ value = $x.serverName }
+                  location = @{ value = $x.location }
+                  administratorLogin = @{ value = $x.administratorLogin }
+                  administratorLoginPassword = @{ value = $env:POSTGRES_ADMIN_PASSWORD }
+                  version = @{ value = [string]$x.version }
+                  skuName = @{ value = $x.skuName }
+                  skuTier = @{ value = $x.skuTier }
+                  storageSizeGB = @{ value = [int]$x.storageSizeGB }
+                  backupRetentionDays = @{ value = [int]$x.backupRetentionDays }
+                  vnetName = @{ value = $x.vnetName }
+                  subnetName = @{ value = $x.subnetName }
+                  subnetAddressPrefix = @{ value = $x.subnetAddressPrefix }
+                  privateDnsZoneName = @{ value = $x.privateDnsZoneName }
+                  privateDnsZoneLinkName = @{ value = $x.privateDnsZoneLinkName }
+                  tags = @{ value = $x.tags }
+                }
+              }
+
+              $parameterFile = Join-Path $env:RUNNER_TEMP "postgresql-$([guid]::NewGuid().ToString('N')).json"
+              $parameters | ConvertTo-Json -Depth 50 | Set-Content -Path $parameterFile -Encoding utf8
+              $deploymentName = "pike-postgresql-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+
+              Write-Host "Running PostgreSQL What-If for '$($x.serverName)'."
+              Write-Host "========== PostgreSQL Debug =========="
+              Write-Host "ServerName=$($x.serverName)"
+              Write-Host "Version=$($x.version)"
+              Write-Host "SkuName=$($x.skuName)"
+              Write-Host "SkuTier=$($x.skuTier)"
+              Write-Host "Location=$($x.location)"
+              Write-Host "Generated Parameter File:"
+              Get-Content $parameterFile
+              Write-Host "======================================"
+              & $az deployment group what-if --resource-group $x.resourceGroupName --name "$deploymentName-preview" --template-file $template --parameters "@$parameterFile"
+              if ($LASTEXITCODE -ne 0) {
+                throw "PostgreSQL What-If failed for '$($x.serverName)'."
+              }
+
+              Write-Host "Deploying PostgreSQL Flexible Server '$($x.serverName)'."
+              & $az deployment group create --resource-group $x.resourceGroupName --name $deploymentName --template-file $template --parameters "@$parameterFile" --output json
+              if ($LASTEXITCODE -ne 0) {
+                throw "PostgreSQL deployment failed for '$($x.serverName)'."
+              }
+
+              Write-Host "PostgreSQL deployment command completed for '$($x.serverName)'."
+            }
+            catch {
+              Write-Warning "PostgreSQL server '$($x.serverName)' failed: $($_.Exception.Message)"
+              continue
+            }
+            finally {
+              if ($parameterFile -and (Test-Path -LiteralPath $parameterFile)) {
+                Remove-Item -LiteralPath $parameterFile -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+  deploy-sql:
+    name: Deploy SQL Databases
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-storage]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy SQL Databases
+        shell: pwsh
+        env:
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+                    $template = "modules/database/sql.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping sqlDatabases; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.sqlDatabases | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No sqlDatabases entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{location=$x.location;serverName=$x.serverName;databaseName=$x.databaseName;administratorLogin=$x.administratorLogin;sqlServerVersion=$x.sqlServerVersion;databaseSkuName=$x.databaseSkuName;databaseSkuTier=$x.databaseSkuTier;databaseCapacity=$x.databaseCapacity;databaseMaxSizeBytes=$x.databaseMaxSizeBytes;publicNetworkAccess=$x.publicNetworkAccess;minimumTlsVersion=$x.minimumTlsVersion;tags=$x.tags}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\sql.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/database/sql.bicep" --parameters "@$f" "administratorLoginPassword=$env:SQL_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "SQL What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-sql-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/database/sql.bicep" --parameters "@$f" "administratorLoginPassword=$env:SQL_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "SQL deployment failed"; continue}
+          }
+
+  deploy-openai:
+    name: Deploy Azure OpenAI Services
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-sql]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Azure OpenAI
+        shell: pwsh
+        env:
+          DEPLOYMENT_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+          Write-Host "Configured Azure OpenAI names: $((@($cfg.landingZones.openAiServices) | ForEach-Object { $_.name }) -join ', ')"
+                    $template = "modules/ai/openai.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping openAiServices; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.openAiServices | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No openAiServices entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{accountName=$x.name;deploymentSuffix=$env:DEPLOYMENT_SUFFIX;location=$x.location;skuName=$x.skuName;customSubDomainName=$x.customSubDomainName;publicNetworkAccess=$x.publicNetworkAccess;tags=$x.tags}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\openai.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/ai/openai.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "OpenAI What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-openai-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/ai/openai.bicep" --parameters "@$f"; if($LASTEXITCODE -ne 0){Write-Warning "OpenAI deployment failed"; continue}
+          }
+
+  deploy-vm:
+    name: Deploy Virtual Machines
+    runs-on: [self-hosted, X64, Windows]
+    needs: [prechecks, azure-login-check, deploy-openai]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: What-If and deploy Virtual Machines
+        shell: pwsh
+        env:
+          VM_ADMIN_PASSWORD: ${{ secrets.VM_ADMIN_PASSWORD }}
+        run: |
+          $ErrorActionPreference="Stop"; $az="C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"; $cfg=Get-Content input.json -Raw|ConvertFrom-Json
+                    $template = "modules/compute/vm.bicep"
+          if (-not (Test-Path -LiteralPath $template)) {
+            Write-Warning "Module $template is missing. Skipping vms; later deployment jobs will still run."
+            return
+          }
+          $items = @($cfg.landingZones.vms | Where-Object { $null -ne $_ })
+          if ($items.Count -eq 0) {
+            Write-Host "No vms entries configured. Skipping this resource type."
+            return
+          }
+          foreach ($x in $items) {
+            $v=@{location=$x.location;computerName=$x.computerName;vmName=$x.name;adminUsername=$x.adminUsername;vmSize=$x.vmSize;tags=$x.tags;vnetName=$x.vnetName;subnetName=$x.subnetName;nicName=$x.nicName;privateIpAllocationMethod=$x.privateIpAllocationMethod;imagePublisher=$x.imagePublisher;imageOffer=$x.imageOffer;imageSku=$x.imageSku;imageVersion=$x.imageVersion;osDiskStorageAccountType=$x.osDiskStorageAccountType;osDiskCreateOption=$x.osDiskCreateOption;osDiskSizeGB=$x.osDiskSizeGB;enableBootDiagnostics=$x.enableBootDiagnostics}; $p=@{'$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#';contentVersion='1.0.0.0';parameters=@{}}
+            foreach($k in $v.Keys){$p.parameters[$k]=@{value=$v[$k]}}; $f="$env:RUNNER_TEMP\vm.json"; $p|ConvertTo-Json -Depth 100|Set-Content $f
+            & $az deployment group what-if -g $x.resourceGroupName -f "modules/compute/vm.bicep" --parameters "@$f" "vmAdminPassword=$env:VM_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "VM What-If failed"; continue}
+            & $az deployment group create -g $x.resourceGroupName -n "pike-vm-${{ github.run_id }}-$([guid]::NewGuid().ToString('N').Substring(0,8))" -f "modules/compute/vm.bicep" --parameters "@$f" "vmAdminPassword=$env:VM_ADMIN_PASSWORD"; if($LASTEXITCODE -ne 0){Write-Warning "VM deployment failed"; continue}
+          }
+          
+  access-management:
+    name: Final RBAC and PIM access management
+    needs: [prechecks, azure-login-check, deploy-vm]
+    if: ${{ always() && needs.prechecks.result == 'success' && needs.azure-login-check.result == 'success' }}
+    uses: ./.github/workflows/access.yml
+    with:
+      environment: dev
+    secrets: inherit
