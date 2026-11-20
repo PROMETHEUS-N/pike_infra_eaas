@@ -8,25 +8,25 @@
   },
   "resourceTargets": {
     "resourceGroup": "yes",
-    "networkSecurityGroup": "yes",
-    "routeTable": "yes",
-    "virtualNetwork": "yes",
-    "subnet": "yes",
-    "applicationGatewaySubnet": "yes",
-    "loadBalancer": "yes",
-    "applicationGateway": "yes",
-    "keyVault": "yes",
-    "storageAccount": "yes",
-    "sqlDatabase": "yes",
-    "openAi": "yes",
+    "networkSecurityGroup": "no",
+    "routeTable": "no",
+    "virtualNetwork": "no",
+    "subnet": "no",
+    "applicationGatewaySubnet": "no",
+    "loadBalancer": "no",
+    "applicationGateway": "no",
+    "keyVault": "no",
+    "storageAccount": "no",
+    "sqlDatabase": "no",
+    "openAi": "no",
     "vmWindows": "no",
     "vmLinux": "no",
-    "vmWindowsSql": "yes",
-    "postgresql": "yes"
+    "vmWindowsSql": "no",
+    "postgresql": "no"
   },
   "accessRequests": {
     "rbac": {
-      "request": "yes",
+      "request": "no",
       "requestorEmail": "SKumarMunis-Hex-adm@pike.com"
     },
     "pim": {
