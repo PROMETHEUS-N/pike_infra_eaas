@@ -1,47 +1,93 @@
-param applicationGatewayName string
+// Pike naming: agw-pike-<env>      e.g. agw-pike-dev   (public IP: pip-agw-pike-<env>)
+// Gateway subnet: snet-<purpose>-agw inside vnet-pike-<env>
+
+@description('Environment token.')
+@allowed(['dev', 'qa', 'uat', 'prod'])
+param environmentName string
+
+@description('Workload token (used for the workload tag).')
+@minLength(3)
+@maxLength(60)
+param workload string
+
+@description('Deployment purpose token (input.json target.purpose); locates snet-<purpose>-agw.')
+@minLength(2)
+@maxLength(11)
+param purpose string
+
+@description('Azure region.')
 param location string
-param vnetName string
-param subnetName string
-param publicIpName string
+
+@description('Application gateway SKU (name and tier use the same value).')
+@allowed(['Standard_v2', 'WAF_v2'])
+param skuName string
+
+@description('Static private frontend IP inside the gateway subnet.')
 param privateFrontendIp string
+
+@minValue(0)
+@maxValue(125)
+param minCapacity int
+
 @minValue(2)
 @maxValue(125)
-param minCapacity int = 2
-@minValue(2)
-@maxValue(125)
-param maxCapacity int = 2
+param maxCapacity int
+
+@description('Frontend port objects: { name, port }.')
 param frontendPorts array
+
+@description('Backend pool objects: { name, backendAddresses }.')
 param backendPools array
+
+@description('Backend HTTP setting objects.')
 param backendHttpSettings array
+
+@description('Health probe objects.')
 param healthProbes array
+
+@description('Listener objects. frontendIPConfigurationName must be frontend-public or frontend-private.')
 param listeners array
+
+@description('Routing rule objects.')
 param routingRules array
-param enableHttp2 bool = true
-param tags object = {}
+
+@description('Enable HTTP/2.')
+param enableHttp2 bool
+
+@description('Tags. Must contain owner, cost-center and data-class; env and workload are added here.')
+param tags object
+
+var applicationGatewayName = 'agw-pike-${environmentName}'
+var publicIpName = 'pip-agw-pike-${environmentName}'
+var vnetName = 'vnet-pike-${environmentName}'
+var resourceTags = union(tags, { env: environmentName, workload: workload })
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' existing = {
   name: vnetName
 }
+
 resource subnet 'Microsoft.Network/virtualNetworks/subnets@2023-09-01' existing = {
   parent: vnet
-  name: subnetName
+  name: 'snet-${purpose}-agw'
 }
+
 resource publicIp 'Microsoft.Network/publicIPAddresses@2023-09-01' = {
   name: publicIpName
   location: location
-  tags: tags
+  tags: resourceTags
   sku: { name: 'Standard' }
   properties: {
     publicIPAllocationMethod: 'Static'
     publicIPAddressVersion: 'IPv4'
   }
 }
+
 resource appGateway 'Microsoft.Network/applicationGateways@2023-09-01' = {
   name: applicationGatewayName
   location: location
-  tags: tags
+  tags: resourceTags
   properties: {
-    sku: { name: 'Standard_v2', tier: 'Standard_v2' }
+    sku: { name: skuName, tier: skuName }
     autoscaleConfiguration: {
       minCapacity: minCapacity
       maxCapacity: maxCapacity
@@ -115,5 +161,7 @@ resource appGateway 'Microsoft.Network/applicationGateways@2023-09-01' = {
     }]
   }
 }
-output applicationGatewayId string = appGateway.id
+
+output deployedResourceId string = appGateway.id
+output deployedResourceName string = appGateway.name
 output publicIpAddress string = publicIp.properties.ipAddress

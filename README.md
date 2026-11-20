@@ -19,6 +19,7 @@
 - [⚙️ Configuration with inputjson](#️-configuration-with-inputjson)
 - [🧩 Bicep module catalogue](#-bicep-module-catalogue)
 - [🚀 GitHub Actions workflow](#-github-actions-workflow)
+  - [Resource dependencies](#resource-dependencies)
 - [🔐 Authentication and secrets](#-authentication-and-secrets)
 - [🔄 Deployment lifecycle](#-deployment-lifecycle)
 - [🧪 Validation and deployment behaviour](#-validation-and-deployment-behaviour)
@@ -249,70 +250,118 @@ Modules are kept separate by Azure resource responsibility. They accept paramete
 - `contents: read` — checkout repository content.
 - `id-token: write` — request the GitHub OIDC token used for Azure login.
 
-### Job sequence in the current workflow
+### Job sequence (dynamic sequential plan)
 
 ```mermaid
 flowchart TD
-    A["workflow_dispatch"] --> B["prechecks"]
-    B --> C["azure-login-check"]
-    C --> D["deploy-rg"]
-    D --> E["deploy-nsg"]
-    E --> F["deploy-route-table"]
-    F --> G["deploy-vnet"]
-    G --> H["deploy-subnet"]
-    H --> I["deploy-keyvault"]
-    I --> J["deploy-storage"]
-    J --> K["deploy-sql"]
-    K --> L["deploy-openai"]
-    L --> M["deploy-vm"]
-
-    subgraph VALIDATION["🧪 Validation and authentication"]
-      B
-      C
-    end
-    subgraph NETWORK["🌐 Network foundation"]
-      E
-      F
-      G
-      H
-    end
-    subgraph SERVICES["🔐 Platform services and compute"]
-      I
-      J
-      K
-      L
-      M
-    end
+    A["workflow_dispatch"] --> B["prechecks<br/>validate-workflows.yml"]
+    B --> C["plan<br/>read input.json, build ordered plan"]
+    C --> D["context<br/>Azure OIDC login, subscription check, RG name"]
+    D --> E["deploy<br/>ONE job, walks the plan one entry at a time"]
+    E --> F["access-management<br/>access.yml (RBAC / PIM)"]
+    F --> G["inventory<br/>CSV artifact, always runs"]
 
     classDef start fill:#163A5F,stroke:#4EA5D9,color:#fff
     classDef validation fill:#51356D,stroke:#B58AD6,color:#fff
-    classDef network fill:#145A43,stroke:#58C99A,color:#fff
-    classDef services fill:#7A4B12,stroke:#E6A23C,color:#fff
-
-    class A,D start
-    class B,C validation
-    class E,F,G,H network
-    class I,J,K,L,M services
+    classDef deploy fill:#145A43,stroke:#58C99A,color:#fff
+    classDef report fill:#7A4B12,stroke:#E6A23C,color:#fff
+    class A start
+    class B,C,D validation
+    class E,F deploy
+    class G report
 ```
+
+The workflow deploys **only** the resources set to `"yes"` in `input.json`, plus the prerequisites they need. Resources that are not in the plan do not appear in the run at all. Deployments never run in parallel.
+
+**Example:** an `input.json` with only `"storageAccount": "yes"` produces this plan:
+
+```text
+1. Resource Group     (prerequisite of storageAccount, added automatically)
+2. Storage Account    (requested in input.json)
+```
+
+The plan, with the reason for each entry, is shown in the run summary of the `plan` job.
 
 ### Job responsibilities
 
 | Job | Responsibility |
 |---|---|
-| `prechecks` | Checks Azure CLI, installs/upgrades Bicep, checks required secrets, builds Bicep files and validates key JSON structure |
-| `azure-login-check` | Authenticates with OIDC and verifies the selected subscription |
-| `deploy-rg` | Runs subscription-scope What-If and creates configured resource groups |
-| `deploy-nsg` | Deploys configured NSGs |
-| `deploy-route-table` | Deploys route tables |
-| `deploy-vnet` | Deploys VNets; skips a VNet if it already exists to avoid replacing its subnet configuration |
-| `deploy-subnet` | Deploys subnets and their NSG/route-table associations |
-| `deploy-keyvault` | Deploys Key Vaults using the authenticated tenant ID |
-| `deploy-storage` | Deploys storage accounts, blob service and containers |
-| `deploy-sql` | Deploys SQL logical servers and databases |
-| `deploy-openai` | Deploys Azure OpenAI accounts |
-| `deploy-vm` | Deploys Windows VMs and their network interfaces |
+| `prechecks` | Calls `validate-workflows.yml`: Bicep build, actionlint, zizmor and `input.json` structure checks |
+| `plan` | Validates `input.json`, adds required prerequisites and outputs the ordered deployment plan |
+| `context` | Logs in with OIDC, verifies the subscription, checks `RESOURCE_TAGS` and resolves the resource group name |
+| `deploy` | Deploys each plan entry in order through `.github/actions/deploy-bicep` (validate parameters → What-If → deploy) |
+| `access-management` | Runs `access.yml` for RBAC / PIM requests, after the deployment plan |
+| `inventory` | Builds `artifacts/deployment-inventory-<run-id>.csv` from the plan results and uploads it, even on failure |
 
-Each deployment job checks out the repository, logs into Azure and reads `input.json`. Each resource collection is processed using a PowerShell `foreach` loop.
+### Resource dependencies
+
+Every resource needs the resource group. The table shows the full chain each resource needs. Missing prerequisites are added to the plan automatically.
+
+| Resource (`resourceTargets` key) | Required chain (deployed in this order) | What the module looks up |
+|---|---|---|
+| Resource Group (`resourceGroup`) | — | — |
+| NSG (`networkSecurityGroup`) | RG | — |
+| Route Table (`routeTable`) | RG | — |
+| Virtual Network (`virtualNetwork`) | RG | — |
+| Subnet (`subnet`) | RG → VNet | `vnet-pike-<env>` |
+| App Gateway Subnet (`applicationGatewaySubnet`) | RG → VNet | `vnet-pike-<env>` |
+| Load Balancer (`loadBalancer`) | RG → VNet → Subnet | subnet `snet-<purpose>` (private frontend IP) |
+| Application Gateway (`applicationGateway`) | RG → VNet → App Gateway Subnet | subnet `snet-<purpose>-agw` |
+| VM Windows / Linux / Windows-SQL (`vmWindows`, `vmLinux`, `vmWindowsSql`) | RG → VNet → Subnet | VNet + subnet `snet-<purpose>` for the NIC |
+| PostgreSQL (`postgresql`) | RG → VNet | VNet only; the module creates its own subnet `snet-<purpose>-psql` |
+| Key Vault (`keyVault`) | RG | — |
+| Storage Account (`storageAccount`) | RG | — |
+| Azure SQL (`sqlDatabase`) | RG | — |
+| Azure OpenAI (`openAi`) | RG | — |
+
+**Optional links.** These are used only when that resource is also `"yes"`:
+
+| Resource | Optional | Effect |
+|---|---|---|
+| Subnet | NSG | The NSG is deployed first and associated with the subnet, so it filters the VMs and load balancer in that subnet |
+| Subnet | Route Table | The route table is deployed first and associated with the subnet |
+
+> ℹ️ A VM does **not** require an NSG. The VM's NIC has no NSG of its own; NSG protection comes from the subnet. For a VM behind an NSG, set `networkSecurityGroup`, `subnet` and the VM to `"yes"`. The plan becomes RG → NSG → VNet → Subnet (NSG attached) → VM.
+
+**Created inside a module** (not separate `input.json` entries):
+
+| Module | Also creates |
+|---|---|
+| VM | Network interface `nic-<vm name>` (private IP only) |
+| Application Gateway | Public IP `pip-agw-pike-<env>` |
+| PostgreSQL | Delegated subnet, private DNS zone and VNet link |
+
+**Access requests** are not added to the plan automatically:
+
+| Request | Needs |
+|---|---|
+| RBAC with `RBAC_SCOPE=resourceGroup` | RG must exist (set `resourceGroup: "yes"` or create it earlier) |
+| RBAC with `RBAC_SCOPE=storageAccount` | RG and Storage Account must exist |
+| RBAC with `RBAC_SCOPE=subscription`, or PIM | Nothing |
+
+### Prerequisite handling rules
+
+- An **auto-added** prerequisite (one that is not `"yes"` in `input.json`) is created **only if it does not exist**. If What-If shows that it already exists, it is reported as `Skipped` and not re-applied, so existing configuration (for example an NSG already attached to a subnet) is never changed.
+- The **resource group** is always applied, because re-applying it is idempotent (same name, location and tags).
+- An existing **VNet** is never re-applied, even when it is requested, so subnets created later are not removed.
+- If an entry **fails**, every entry that depends on it is skipped and independent entries still run. The run is marked failed if anything failed or was blocked.
+- The Azure OIDC login is refreshed before each entry, so a long plan does not outlive the Azure CLI token.
+
+### Where these rules live in the code
+
+| What | Location |
+|---|---|
+| Dependency table (`CATALOG`): `requires` = required prerequisites, `after` = optional ordering links, list order = deployment order | `.github/workflows/deploy.yml` → `plan` job, `const CATALOG = [...]` |
+| Subnet attaches the NSG / route table only when they are `"yes"` | `CATALOG` → `subnet` entry (`attachNetworkSecurityGroup`, `attachRouteTable`) |
+| Self-check: a prerequisite must be listed before the resource that needs it | `plan` job, the "Self-check" block after `CATALOG` |
+| Adding missing prerequisites (transitively) | `plan` job, the `const reason = {}` loop |
+| "Create only if missing" for auto-added entries | `plan` job, `skipIfExistsType:` |
+| Recording each entry's dependencies | `plan` job, `dependsOn:` |
+| Skipping an entry whose prerequisite failed | `.github/actions/deploy-bicep/action.yml`, `badPrereqs` |
+| Skipping a resource that already exists (What-If) | `.github/actions/deploy-bicep/action.yml`, the `skipIfExistsType` check |
+| Job-level conditions (`deploy` runs only if the plan is not empty, `access-management` is blocked if the RG failed, `inventory` always runs) | `.github/workflows/deploy.yml`, the `if:` of each job |
+
+**To change a dependency**, edit that resource's `requires` list in `CATALOG`. **To add a resource type**, add a `CATALOG` entry for an existing module at the right point in dependency order, and add the same key to `resourceTargets` in `input.json` and to the target list in `validate-workflows.yml`.
 
 ---
 
@@ -320,7 +369,7 @@ Each deployment job checks out the repository, logs into Azure and reads `input.
 
 Azure authentication uses GitHub Actions OIDC through `azure/login@v2`. This avoids storing a client secret for the GitHub-to-Azure authentication flow.
 
-Configure the following GitHub Actions secrets. They may be repository secrets or secrets available to the `dev` environment as appropriate.
+Configure the following secrets in the GitHub Environment named by `input.json` → `environment` (for example `dev`). All non-secret values (SKUs, sizes, images, CIDRs, naming tokens and tags) are GitHub Environment **variables** in that same environment. `input.json` contains only yes/no flags. See [docs/github-environment-variables.md](docs/github-environment-variables.md) for every key and its `dev` value.
 
 | Secret | Purpose |
 |---|---|
@@ -329,6 +378,7 @@ Configure the following GitHub Actions secrets. They may be repository secrets o
 | `AZURE_SUBSCRIPTION_ID` | Target Azure subscription GUID |
 | `VM_ADMIN_PASSWORD` | Windows VM local administrator password |
 | `SQL_ADMIN_PASSWORD` | SQL administrator password |
+| `POSTGRESQL_ADMIN_PASSWORD` | PostgreSQL Flexible Server administrator password (required when `postgresqlServers` is in `input.json`) |
 
 ### OIDC trust prerequisites
 
@@ -408,15 +458,13 @@ The `prechecks` job currently:
 
 ### Current failure behaviour
 
-The current workflow uses sequential GitHub Actions jobs with `needs`. A failed job normally causes dependent jobs to be skipped. In addition, a failed What-If or deployment throws an error in the PowerShell step, stopping that step/job.
+The `deploy` job walks the plan in order. When an entry fails, the entries that depend on it are skipped (`Skipped`, naming the failed prerequisite) and independent entries continue. The run fails if any entry failed or was blocked.
 
-For example, if `deploy-keyvault` fails, the dependent storage, SQL, OpenAI and VM jobs will not run under the current dependency chain.
-
-The final resource verification job is present only as commented-out YAML. It is not active, and the workflow does not currently generate a final per-resource deployment report artifact.
+Every run ends with the `inventory` job. It uploads a CSV with one row per plan entry, showing its status (`Succeeded`, `Skipped` or `Failed`) and why it was in the plan.
 
 ### Existing-resource handling
 
-The VNet job checks whether the configured VNet already exists. If it does, the workflow skips the VNet template to avoid replacing existing subnet configuration. The subnet job then runs as a separate stage.
+The VNet is never re-applied when it already exists, so subnets created later are not removed. Prerequisites that were added automatically are created only when they are missing. See [Prerequisite handling rules](#prerequisite-handling-rules).
 
 ---
 

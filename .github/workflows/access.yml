@@ -1,323 +1,193 @@
 name: PIKE Access Management - RBAC and PIM
 
+# Called by deploy.yml. One job per access request type:
+#   rbac job -> runs only when input.json accessRequests.rbac = "yes"
+#   pim job  -> runs only when input.json accessRequests.pim  = "yes"
+# The requestor email comes from input.json (accessRequests.<rbac|pim>.requestorEmail);
+# all other request details come from GitHub Environment variables (no values in code).
+# The existing modules under modules/access are deployed through the shared
+# .github/actions/deploy-bicep action. No PowerShell is used.
+
 on:
   workflow_call:
     inputs:
       environment:
-        description: GitHub environment containing the Azure OIDC configuration
+        description: GitHub Environment (dev, qa, uat, prod).
+        required: true
+        type: string
+      resource-group:
+        description: Target resource group name.
+        required: true
+        type: string
+      rbac:
+        description: yes or no.
+        required: true
+        type: string
+      pim:
+        description: yes or no.
+        required: true
+        type: string
+      rbac-requestor-email:
+        description: Requestor email from input.json accessRequests.rbac.requestorEmail.
         required: false
         type: string
-        default: dev
+        default: ''
+      pim-requestor-email:
+        description: Requestor email from input.json accessRequests.pim.requestorEmail.
+        required: false
+        type: string
+        default: ''
+      location:
+        description: Azure region from input.json target.location (used for subscription-scope deployments).
+        required: true
+        type: string
+    outputs:
+      rbac-status:
+        value: ${{ jobs.rbac.outputs.status }}
+      rbac-name:
+        value: ${{ jobs.rbac.outputs.resource-name }}
+      rbac-id:
+        value: ${{ jobs.rbac.outputs.resource-id }}
+      rbac-error:
+        value: ${{ jobs.rbac.outputs.error }}
+      pim-status:
+        value: ${{ jobs.pim.outputs.status }}
+      pim-name:
+        value: ${{ jobs.pim.outputs.resource-name }}
+      pim-id:
+        value: ${{ jobs.pim.outputs.resource-id }}
+      pim-error:
+        value: ${{ jobs.pim.outputs.error }}
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  manage-access:
-    name: Process RBAC and PIM access requests
+  rbac:
+    name: RBAC role assignment
+    if: ${{ inputs.rbac == 'yes' }}
     runs-on: [self-hosted, X64, Windows]
     environment: ${{ inputs.environment }}
+    outputs:
+      status: ${{ steps.deploy.outputs.status || 'Failed' }}
+      resource-name: ${{ steps.deploy.outputs.resource-name }}
+      resource-id: ${{ steps.deploy.outputs.resource-id }}
+      error: ${{ steps.deploy.outputs.error || steps.principal.outputs.error }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Authenticate to Azure using OIDC
+      - name: Azure login using OIDC
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Process RBAC and PIM entries from input.json
-        shell: pwsh
+      - name: Validate scope and resolve principal
+        id: principal
+        uses: actions/github-script@v7
         env:
-          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $az = "C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
-          if (-not (Test-Path -LiteralPath $az)) { $az = "az" }
-          if (-not (Test-Path -LiteralPath "input.json")) { throw "input.json was not found." }
-
-          $cfg = Get-Content "input.json" -Raw | ConvertFrom-Json
-          $results = [System.Collections.Generic.List[object]]::new()
-
-          function Add-Result {
-            param([string]$Type,[string]$Scope,[string]$Target,[string]$Principal,[string]$Role,[string]$Status,[string]$Id="",[string]$ErrorMessage="",[string]$PrincipalType="",[string]$RequestType="",[string]$Duration="")
-            $results.Add([PSCustomObject]@{ AccessType=$Type; Scope=$Scope; Target=$Target; Principal=$Principal; PrincipalType=$PrincipalType; Role=$Role; RequestType=$RequestType; Duration=$Duration; Status=$Status; RequestOrAssignmentId=$Id; Error=$ErrorMessage })
-          }
-
-          function Get-Entries {
-            param($Object,[string]$Name)
-            if ($null -eq $Object) { return @() }
-            $p = $Object.PSObject.Properties[$Name]
-            if ($null -eq $p -or $null -eq $p.Value) { return @() }
-            return @($p.Value | Where-Object { $null -ne $_ })
-          }
-
-          function Resolve-Principal {
-            param($Entry)
-            if (-not [string]::IsNullOrWhiteSpace([string]$Entry.principalId)) {
-              if ([string]$Entry.principalId -notmatch '^[0-9a-fA-F-]{36}$') { throw "principalId must be an Entra object ID GUID." }
-              return ([string]$Entry.principalId).ToLowerInvariant()
-            }
-            if ([string]::IsNullOrWhiteSpace([string]$Entry.principalEmail)) { throw "principalId or principalEmail is required." }
-            $type = [string]$Entry.principalType
-            if ([string]::IsNullOrWhiteSpace($type)) { $type = "User" }
-            switch ($type) {
-              "User" { $value = & $az ad user show --id $Entry.principalEmail --query id -o tsv 2>&1 }
-              "Group" { $value = & $az ad group show --group $Entry.principalEmail --query id -o tsv 2>&1 }
-              "ServicePrincipal" { $value = & $az ad sp show --id $Entry.principalEmail --query id -o tsv 2>&1 }
-              default { throw "Unsupported principalType '$type'. Use User, Group, or ServicePrincipal." }
-            }
-            if ($LASTEXITCODE -ne 0) { throw "Entra principal lookup failed: $($value -join ' ')" }
-            $id = ($value -join "").Trim()
-            if ($id -notmatch '^[0-9a-fA-F-]{36}$') { throw "Principal lookup did not return a valid object ID." }
-            return $id.ToLowerInvariant()
-          }
-
-          function Invoke-Rbac {
-            param([string]$ScopeName,[string]$Template,[string]$DeploymentScope,[string]$Target,$Entry,[hashtable]$Extra=@{})
-            $principal = if ($Entry.principalEmail) { [string]$Entry.principalEmail } else { [string]$Entry.principalId }
-            try {
-              if (-not (Test-Path -LiteralPath $Template)) { throw "Bicep template not found: $Template" }
-              if ([string]::IsNullOrWhiteSpace([string]$Entry.roleDefinitionGuid)) { throw "roleDefinitionGuid is required." }
-              $parameters = @{ principalId=(Resolve-Principal $Entry); roleDefinitionGuid=[string]$Entry.roleDefinitionGuid; principalType=([string]$Entry.principalType) }
-              if ([string]::IsNullOrWhiteSpace($parameters.principalType)) { $parameters.principalType = "User" }
-              foreach ($key in $Extra.Keys) { $parameters[$key] = $Extra[$key] }
-              $parameterObject = @{ '$schema'='https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'; contentVersion='1.0.0.0'; parameters=@{} }
-              foreach ($key in $parameters.Keys) { $parameterObject.parameters[$key] = @{ value=$parameters[$key] } }
-              $parameterFile = Join-Path $env:RUNNER_TEMP "rbac-$([guid]::NewGuid()).json"
-              $parameterObject | ConvertTo-Json -Depth 30 | Set-Content -Path $parameterFile -Encoding utf8
-              $deploymentName = "pike-rbac-$ScopeName-$env:RUN_ID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-              $whatIf = @("deployment",$DeploymentScope,"what-if","--name","$deploymentName-preview","--template-file",$Template,"--parameters","@$parameterFile")
-              $create = @("deployment",$DeploymentScope,"create","--name",$deploymentName,"--template-file",$Template,"--parameters","@$parameterFile","--output","json")
-              if ($DeploymentScope -eq "sub") {
-                $location = [string]$cfg.location
-                if ([string]::IsNullOrWhiteSpace($location)) { throw "Root-level input.json location is required for subscription RBAC." }
-                $whatIf += @("--location",$location); $create += @("--location",$location)
-              } else {
-                $whatIf += @("--resource-group",$Target); $create += @("--resource-group",$Target)
-              }
-              & $az @whatIf
-              if ($LASTEXITCODE -ne 0) { throw "RBAC What-If failed." }
-              $output = & $az @create
-              if ($LASTEXITCODE -ne 0) { throw "RBAC deployment failed." }
-              $deployment = ($output -join "`n") | ConvertFrom-Json
-              Add-Result "RBAC" $ScopeName $Target $principal ([string]$Entry.roleDefinitionName) "DEPLOYED" ([string]$deployment.properties.outputs.roleAssignmentId.value)
-            } catch {
-              Add-Result "RBAC" $ScopeName $Target $principal ([string]$Entry.roleDefinitionName) "FAILED" "" $_.Exception.Message
-              Write-Warning "RBAC $ScopeName failed: $($_.Exception.Message)"
-            }
-          }
-
-          function Invoke-Pim {
-            param($Entry)
-            $principal = if ($Entry.principalEmail) { [string]$Entry.principalEmail } else { [string]$Entry.principalId }
-            $scopeName = [string]$Entry.scope.type
-            $target = ""
-            try {
-              $principalId = Resolve-Principal $Entry
-              $subscriptionId = [string]$env:AZURE_SUBSCRIPTION_ID
-              switch ($scopeName.ToLowerInvariant()) {
-                "subscription" { $scopeId = "/subscriptions/$subscriptionId"; $target = $scopeId }
-                "resourcegroup" {
-                  if ([string]::IsNullOrWhiteSpace([string]$Entry.scope.resourceGroupName)) { throw "scope.resourceGroupName is required." }
-                  $scopeId = "/subscriptions/$subscriptionId/resourceGroups/$($Entry.scope.resourceGroupName)"
-                  $target = [string]$Entry.scope.resourceGroupName
-                }
-                "resource" {
-                  $scopeId = [string]$Entry.scope.resourceId
-                  if ($scopeId -notmatch '^/subscriptions/[0-9a-fA-F-]{36}/') { throw "scope.resourceId must be a full Azure resource ID." }
-                  $target = $scopeId
-                }
-                default { throw "PIM scope.type must be Subscription, ResourceGroup, or Resource." }
-              }
-              if ([string]::IsNullOrWhiteSpace($subscriptionId)) { throw "AZURE_SUBSCRIPTION_ID is unavailable." }
-
-              $roleId = [string]$Entry.roleDefinitionId
-              if ([string]::IsNullOrWhiteSpace($roleId)) { $roleId = [string]$Entry.roleDefinitionGuid }
-              if ([string]::IsNullOrWhiteSpace($roleId)) { throw "roleDefinitionId or roleDefinitionGuid is required." }
-              if ($roleId -match '^[0-9a-fA-F-]{36}$') { $roleId = "/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleDefinitions/$roleId" }
-              if ($roleId -notmatch '^/') { throw "roleDefinitionId must be a GUID or full Azure role definition resource ID." }
-
-              $requestType = [string]$Entry.requestType
-              $allowed = @("AdminAssign","AdminUpdate","AdminRemove","AdminExtend","AdminRenew")
-              if ($requestType -notin $allowed) { throw "requestType must be one of: $($allowed -join ', ')." }
-
-              $schedule = $Entry.schedule
-              if ($null -eq $schedule) { throw "PIM schedule object is required." }
-              $expirationType = [string]$schedule.expirationType
-              if ([string]::IsNullOrWhiteSpace($expirationType)) { $expirationType = "AfterDuration" }
-              if ($expirationType -notin @("AfterDuration","NoExpiration","AfterDateTime")) { throw "Unsupported schedule.expirationType." }
-              $start = [string]$schedule.startDateTime
-              if ([string]::IsNullOrWhiteSpace($start)) { $start = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
-              $expiration = @{ type=$expirationType }
-              if ($expirationType -eq "AfterDuration") {
-                $duration = [string]$schedule.duration
-                $allowedDurations = @("PT1H","PT2H","PT3H","PT4H","PT5H","PT6H","PT8H","PT12H","PT24H","P1D","P7D","P30D","P90D","P180D","P365D","P1M","P3M","P6M","P12M","P1Y")
-                if ($duration -notin $allowedDurations) { throw "Unsupported PIM duration '$duration'. Allowed values: $($allowedDurations -join ', ')." }
-                $expiration.duration = $duration
-              } elseif ($expirationType -eq "AfterDateTime") {
-                if ([string]::IsNullOrWhiteSpace([string]$schedule.endDateTime)) { throw "schedule.endDateTime is required for AfterDateTime." }
-                $expiration.endDateTime = [string]$schedule.endDateTime
-              }
-              $properties = @{
-                principalId=$principalId
-                roleDefinitionId=$roleId
-                requestType=$requestType
-                justification=([string]$Entry.justification)
-                scheduleInfo=@{ startDateTime=$start; expiration=$expiration }
-              }
-              if ([string]::IsNullOrWhiteSpace($properties.justification)) { $properties.justification = "Requested through PIKE access workflow." }
-              if ($Entry.ticketInfo) {
-                $properties.ticketInfo = @{ ticketSystem=[string]$Entry.ticketInfo.ticketSystem; ticketNumber=[string]$Entry.ticketInfo.ticketNumber }
-              }
-              if ($requestType -ne "AdminAssign") {
-                if ([string]::IsNullOrWhiteSpace([string]$Entry.targetRoleEligibilityScheduleId)) { throw "targetRoleEligibilityScheduleId is required for $requestType." }
-                $properties.targetRoleEligibilityScheduleId = [string]$Entry.targetRoleEligibilityScheduleId
-              }
-              $requestId = [guid]::NewGuid().ToString()
-              $uri = "https://management.azure.com$($scopeId)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/$requestId?api-version=2020-10-01"
-              $body = @{ properties=$properties } | ConvertTo-Json -Depth 30 -Compress
-              $response = & $az rest --method put --url $uri --headers "Content-Type=application/json" --body $body --output json 2>&1
-              if ($LASTEXITCODE -ne 0) { throw "PIM role eligibility request failed: $($response -join ' ')" }
-              $responseObject = ($response -join "`n") | ConvertFrom-Json
-              $requestResourceId = if ($responseObject.id) { [string]$responseObject.id } else { $requestId }
-              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "SUBMITTED" $requestResourceId "" ([string]$Entry.principalType) $requestType ([string]$schedule.duration)
-            } catch {
-              Add-Result "PIM" $scopeName $target $principal ([string]$Entry.roleDefinitionName) "FAILED" "" $_.Exception.Message ([string]$Entry.principalType) ([string]$Entry.requestType) ([string]$Entry.schedule.duration)
-              Write-Warning "PIM request failed: $($_.Exception.Message)"
-            }
-          }
-
-          # Process only RBAC collections present in input.json.
-          $subscriptionEntries = @(Get-Entries $cfg.rbac "subscriptionAccess")
-          $resourceGroupEntries = @(Get-Entries $cfg.rbac "resourceGroupAccess")
-          $resourceEntries = @(Get-Entries $cfg.rbac "resourceAccess")
-
-          foreach ($entry in $subscriptionEntries) {
-            Invoke-Rbac "subscription" "modules/access/rbac/RBAC_subscription.bicep" "sub" "Subscription" $entry
-          }
-          foreach ($entry in $resourceGroupEntries) {
-            $rgName = [string]$entry.resourceGroupName
-            $matches = @($cfg.landingZones.resourceGroups | Where-Object { $_.rgName -eq $rgName })
-            if ($matches.Count -ne 1) {
-              Add-Result "RBAC" "ResourceGroup" $rgName ([string]$entry.principalEmail) ([string]$entry.roleDefinitionName) "FAILED" "" "Resource group not found uniquely in landingZones.resourceGroups."
-              continue
-            }
-            Invoke-Rbac "resource-group" "modules/access/rbac/RBAC_resource_group.bicep" "group" $rgName $entry
-          }
-          foreach ($entry in $resourceEntries) {
-            if ([string]$entry.resourceType -ne "Microsoft.Storage/storageAccounts") {
-              Add-Result "RBAC" "Resource" ([string]$entry.resourceName) ([string]$entry.principalEmail) ([string]$entry.roleDefinitionName) "FAILED" "" "The current resource RBAC template supports Storage Accounts only."
-              continue
-            }
-            $rgName = [string]$entry.resourceGroupName
-            $resourceName = [string]$entry.resourceName
-            $matches = @($cfg.landingZones.storageAccounts | Where-Object { $_.name -eq $resourceName -and $_.resourceGroupName -eq $rgName })
-            if ($matches.Count -ne 1) {
-              Add-Result "RBAC" "Resource" $resourceName ([string]$entry.principalEmail) ([string]$entry.roleDefinitionName) "FAILED" "" "Storage Account not found uniquely in landingZones.storageAccounts."
-              continue
-            }
-            Invoke-Rbac "resource" "modules/access/rbac/RBAC_resource.bicep" "group" $rgName $entry @{ storageAccountName=$resourceName }
-          }
-
-          # PIM accepts pim as an array, pim.accessRequests[], pim.roleEligibilityRequests[],
-          # or one PIM request object containing a scope property.
-          $pimEntries = @()
-          if ($null -ne $cfg.pim) {
-            if ($cfg.pim -is [System.Array]) { $pimEntries = @($cfg.pim) }
-            elseif ($cfg.pim.PSObject.Properties["accessRequests"]) { $pimEntries = @(Get-Entries $cfg.pim "accessRequests") }
-            elseif ($cfg.pim.PSObject.Properties["roleEligibilityRequests"]) { $pimEntries = @(Get-Entries $cfg.pim "roleEligibilityRequests") }
-            elseif ($cfg.pim.PSObject.Properties["scope"]) { $pimEntries = @($cfg.pim) }
-          }
-          foreach ($entry in $pimEntries) { Invoke-Pim $entry }
-
-          if ($subscriptionEntries.Count -eq 0 -and $resourceGroupEntries.Count -eq 0 -and $resourceEntries.Count -eq 0 -and $pimEntries.Count -eq 0) {
-            Write-Host "No RBAC or PIM entries found in input.json. Access management is skipped."
-          }
-
-          # Build a genuine .xlsx workbook without installing Python packages or PowerShell modules.
-          # The workbook contains separate RBAC and PIM worksheets.
-          function ConvertTo-ExcelColumnName {
-            param([int]$Number)
-            $name = ""
-            while ($Number -gt 0) {
-              $remainder = ($Number - 1) % 26
-              $name = [char](65 + $remainder) + $name
-              $Number = [math]::Floor(($Number - 1) / 26)
-            }
-            return $name
-          }
-
-          function ConvertTo-WorksheetXml {
-            param([object[]]$Rows,[string[]]$Headers)
-            $builder = [System.Text.StringBuilder]::new()
-            [void]$builder.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
-            [void]$builder.Append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>')
-            $allRows = [System.Collections.Generic.List[object]]::new()
-            $allRows.Add([object]$Headers)
-            foreach ($row in $Rows) {
-              $values = @()
-              foreach ($header in $Headers) { $values += [string]$row.$header }
-              $allRows.Add([object]$values)
-            }
-            for ($r = 0; $r -lt $allRows.Count; $r++) {
-              $rowNumber = $r + 1
-              [void]$builder.Append("<row r=`"$rowNumber`">")
-              $values = [object[]]$allRows[$r]
-              for ($col = 0; $col -lt $Headers.Count; $col++) {
-                $cellRef = "$(ConvertTo-ExcelColumnName ($col + 1))$rowNumber"
-                $value = [string]$values[$col]
-                $escaped = [System.Security.SecurityElement]::Escape($value)
-                [void]$builder.Append("<c r=`"$cellRef`" t=`"inlineStr`"><is><t xml:space=`"preserve`">$escaped</t></is></c>")
-              }
-              [void]$builder.Append('</row>')
-            }
-            [void]$builder.Append('</sheetData></worksheet>')
-            return $builder.ToString()
-          }
-
-          function Add-ZipTextEntry {
-            param($Archive,[string]$EntryName,[string]$Content)
-            $entry = $Archive.CreateEntry($EntryName)
-            $stream = $entry.Open()
-            try {
-              $writer = [System.IO.StreamWriter]::new($stream,[System.Text.UTF8Encoding]::new($false))
-              try { $writer.Write($Content) } finally { $writer.Dispose() }
-            } finally { $stream.Dispose() }
-          }
-
-          $columns = @("AccessType","Scope","Target","Principal","PrincipalType","Role","RequestType","Duration","Status","RequestOrAssignmentId","Error")
-          $rbacRows = @($results | Where-Object { $_.AccessType -eq "RBAC" })
-          $pimRows = @($results | Where-Object { $_.AccessType -eq "PIM" })
-          $resultFile = Join-Path $env:RUNNER_TEMP "pike-access-results.xlsx"
-          if (Test-Path -LiteralPath $resultFile) { Remove-Item -LiteralPath $resultFile -Force }
-          Add-Type -AssemblyName System.IO.Compression
-          $fileStream = [System.IO.File]::Open($resultFile,[System.IO.FileMode]::CreateNew)
-          try {
-            $archive = [System.IO.Compression.ZipArchive]::new($fileStream,[System.IO.Compression.ZipArchiveMode]::Create,$true)
-            try {
-              Add-ZipTextEntry $archive "[Content_Types].xml" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
-              Add-ZipTextEntry $archive "_rels/.rels" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
-              Add-ZipTextEntry $archive "xl/workbook.xml" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="RBAC" sheetId="1" r:id="rId1"/><sheet name="PIM" sheetId="2" r:id="rId2"/></sheets></workbook>'
-              Add-ZipTextEntry $archive "xl/_rels/workbook.xml.rels" '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>'
-              Add-ZipTextEntry $archive "xl/worksheets/sheet1.xml" (ConvertTo-WorksheetXml $rbacRows $columns)
-              Add-ZipTextEntry $archive "xl/worksheets/sheet2.xml" (ConvertTo-WorksheetXml $pimRows $columns)
-            } finally { $archive.Dispose() }
-          } finally { $fileStream.Dispose() }
-          $results | Format-Table AccessType, Scope, Target, Principal, Role, Status -AutoSize
-          $failed = @($results | Where-Object { $_.Status -eq "FAILED" })
-          Write-Host "Total access requests: $($results.Count); failed: $($failed.Count)"
-          if ($failed.Count -gt 0) { throw "One or more RBAC/PIM access requests failed. Review the PIKE-Access-Results artifact." }
-
-      - name: Upload RBAC and PIM result report
-        if: always()
-        uses: actions/upload-artifact@v4
+          PREFIX: RBAC
+          SCOPE: ${{ vars.RBAC_SCOPE }}
+          PRINCIPAL_EMAIL: ${{ inputs.rbac-requestor-email }}
         with:
-          name: PIKE-Access-Results-${{ github.run_id }}
-          path: ${{ runner.temp }}/pike-access-results.xlsx
-          if-no-files-found: warn
-          retention-days: 30
+          script: |
+            const fail = (m) => { core.setOutput('error', m); core.setFailed(m); };
+            if (!['subscription', 'resourceGroup', 'storageAccount'].includes(process.env.SCOPE || '')) {
+              return fail('RBAC_SCOPE must be subscription, resourceGroup or storageAccount.');
+            }
+            const guid = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+            const who = (process.env.PRINCIPAL_EMAIL || '').trim();
+            if (!who) return fail('input.json accessRequests.rbac.requestorEmail is empty.');
+            // The requestor is always a Microsoft Entra user.
+            const args = ['ad', 'user', 'show', '--id', who];
+            const r = await exec.getExecOutput('az', [...args, '--query', 'id', '-o', 'tsv'], { ignoreReturnCode: true, silent: true });
+            const resolved = r.stdout.trim();
+            if (r.exitCode !== 0 || !guid.test(resolved)) return fail(`Could not resolve the requestor user in Microsoft Entra ID.`);
+            core.info('Requestor resolved to a Microsoft Entra object ID (ID not printed).');
+            core.setOutput('id', resolved.toLowerCase());
+
+      - name: Deploy RBAC role assignment
+        id: deploy
+        uses: ./.github/actions/deploy-bicep
+        with:
+          template: ${{ vars.RBAC_SCOPE == 'subscription' && 'modules/access/rbac/RBAC_subscription.bicep' || (vars.RBAC_SCOPE == 'storageAccount' && 'modules/access/rbac/RBAC_resource.bicep' || 'modules/access/rbac/RBAC_resource_group.bicep') }}
+          scope: ${{ vars.RBAC_SCOPE == 'subscription' && 'subscription' || 'resourceGroup' }}
+          resource-group: ${{ inputs.resource-group }}
+          location: ${{ inputs.location }}
+          deployment-name: pike-rbac-${{ github.run_id }}-${{ github.run_attempt }}
+          vars-json: ${{ toJSON(vars) }}
+          values: |
+            principalId=${{ steps.principal.outputs.id }}
+            principalType=User
+          variables: |
+            roleDefinitionGuid=RBAC_READER_ROLE_DEFINITION_ID
+            ${{ vars.RBAC_SCOPE == 'storageAccount' && 'storageAccountName=RBAC_STORAGE_ACCOUNT_NAME' || '' }}
+
+  pim:
+    name: PIM eligibility request
+    needs: rbac
+    # Runs after the RBAC job (or when it was not requested), never in parallel with it.
+    if: ${{ !cancelled() && inputs.pim == 'yes' }}
+    runs-on: [self-hosted, X64, Windows]
+    environment: ${{ inputs.environment }}
+    outputs:
+      status: ${{ steps.deploy.outputs.status || 'Failed' }}
+      resource-name: ${{ steps.deploy.outputs.resource-name }}
+      resource-id: ${{ steps.deploy.outputs.resource-id }}
+      error: ${{ steps.deploy.outputs.error || steps.principal.outputs.error }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Azure login using OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate request and resolve principal
+        id: principal
+        uses: actions/github-script@v7
+        env:
+          PRINCIPAL_EMAIL: ${{ inputs.pim-requestor-email }}
+          JUSTIFICATION: ${{ vars.PIM_JUSTIFICATION }}
+        with:
+          script: |
+            const fail = (m) => { core.setOutput('error', m); core.setFailed(m); };
+            if (!(process.env.JUSTIFICATION || '').trim()) return fail('PIM_JUSTIFICATION must be set; PIM requests require a justification.');
+            const guid = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+            const who = (process.env.PRINCIPAL_EMAIL || '').trim();
+            if (!who) return fail('input.json accessRequests.pim.requestorEmail is empty.');
+            // The requestor is always a Microsoft Entra user.
+            const args = ['ad', 'user', 'show', '--id', who];
+            const r = await exec.getExecOutput('az', [...args, '--query', 'id', '-o', 'tsv'], { ignoreReturnCode: true, silent: true });
+            const resolved = r.stdout.trim();
+            if (r.exitCode !== 0 || !guid.test(resolved)) return fail(`Could not resolve the requestor user in Microsoft Entra ID.`);
+            core.info('Requestor resolved to a Microsoft Entra object ID (ID not printed).');
+            core.setOutput('id', resolved.toLowerCase());
+
+      # requestType, duration and the role GUID are validated against the allowed values in
+      # modules/access/pim/pim.bicep by the deploy action before anything is submitted.
+      - name: Submit PIM eligibility request
+        id: deploy
+        uses: ./.github/actions/deploy-bicep
+        with:
+          template: modules/access/pim/pim.bicep
+          scope: subscription
+          location: ${{ inputs.location }}
+          deployment-name: pike-pim-${{ github.run_id }}-${{ github.run_attempt }}
+          vars-json: ${{ toJSON(vars) }}
+          values: |
+            principalId=${{ steps.principal.outputs.id }}
+            requestPolicyValidated=true
+          variables: |
+            roleDefinitionGuid=PIM_READER_ROLE_DEFINITION_ID
+            requestType=PIM_REQUEST_TYPE
+            duration=PIM_MAX_DURATION
+            justification=PIM_JUSTIFICATION

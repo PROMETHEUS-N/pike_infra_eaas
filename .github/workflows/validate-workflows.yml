@@ -132,49 +132,49 @@ jobs:
         id: input
         if: always()
         continue-on-error: true
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $reportDir = Join-Path $env:RUNNER_TEMP "pike-validation"
-          New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
-          $result = [ordered]@{ Status="PASS"; Finding="input.json passed JSON parsing and structure checks." }
-          try {
-            $inputPath = Join-Path (Get-Location) "input.json"
-            if (-not (Test-Path -LiteralPath $inputPath)) { throw "input.json was not found in the repository root." }
-            $cfg = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-            if ($null -eq $cfg -or $cfg -isnot [System.Collections.IDictionary]) { throw "input.json root must be a JSON object." }
-            $environment = ([string]$cfg.environment).Trim().ToLowerInvariant()
-            if ([string]::IsNullOrWhiteSpace($environment)) { throw "input.json must contain a root-level environment." }
-            if ($environment -ne "dev") { throw "Expected environment 'dev' but found '$environment'." }
-            if ([string]::IsNullOrWhiteSpace([string]$cfg.location)) { throw "input.json must contain a non-empty root-level location." }
-            if ($null -eq $cfg.landingZones -or $cfg.landingZones -isnot [System.Collections.IDictionary]) {
-              throw "input.json must contain a landingZones object."
-            }
-            $knownArrays = @("resourceGroups","nsgs","routeTables","vnets","subnets","loadBalancers","applicationGatewaySubnets","applicationGateways","vms","storageAccounts","keyVaults","sqlDatabases","openAiServices")
-            foreach ($name in $knownArrays) {
-              if ($cfg.landingZones.Contains($name) -and $null -ne $cfg.landingZones[$name]) {
-                if ($cfg.landingZones[$name] -isnot [array]) { throw "landingZones.$name must be an array when provided." }
-                if (@($cfg.landingZones[$name] | Where-Object { $null -eq $_ }).Count -gt 0) {
-                  throw "landingZones.$name contains a null entry."
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const dir = path.join(process.env.RUNNER_TEMP, 'pike-validation');
+            fs.mkdirSync(dir, { recursive: true });
+            const targets = ['resourceGroup', 'networkSecurityGroup', 'routeTable', 'virtualNetwork', 'subnet',
+              'applicationGatewaySubnet', 'loadBalancer', 'applicationGateway', 'keyVault', 'storageAccount',
+              'sqlDatabase', 'openAi', 'vmWindows', 'vmLinux', 'vmWindowsSql', 'postgresql'];
+            const errors = [];
+            try {
+              const cfg = JSON.parse(fs.readFileSync('input.json', 'utf8'));
+              if (!['dev', 'qa', 'uat', 'prod'].includes(String(cfg.environment ?? '').trim())) errors.push('environment must be dev, qa, uat or prod.');
+              const check = (name, keys) => {
+                const s = cfg[name];
+                if (!s || typeof s !== 'object' || Array.isArray(s)) { errors.push(`${name} must be an object.`); return; }
+                for (const k of Object.keys(s)) if (!keys.includes(k)) errors.push(`${name}.${k} is not a supported key.`);
+                for (const k of keys) if (!['yes', 'no'].includes(String(s[k] ?? '').trim().toLowerCase())) errors.push(`${name}.${k} must be "yes" or "no".`);
+              };
+              const t = cfg.target;
+              if (!t || typeof t !== 'object' || Array.isArray(t)) errors.push('target must be an object with workload, system, purpose and location.');
+              else for (const k of ['workload', 'system', 'purpose', 'location']) if (!String(t[k] ?? '').trim()) errors.push(`target.${k} must be set.`);
+              check('resourceTargets', targets);
+              const ar = cfg.accessRequests;
+              if (!ar || typeof ar !== 'object' || Array.isArray(ar)) errors.push('accessRequests must be an object.');
+              else {
+                for (const k of Object.keys(ar)) if (!['rbac', 'pim'].includes(k)) errors.push(`accessRequests.${k} is not a supported key.`);
+                for (const k of ['rbac', 'pim']) {
+                  const e = ar[k];
+                  if (!e || typeof e !== 'object') { errors.push(`accessRequests.${k} must be an object with request and requestorEmail.`); continue; }
+                  const req = String(e.request ?? '').trim().toLowerCase();
+                  if (!['yes', 'no'].includes(req)) errors.push(`accessRequests.${k}.request must be "yes" or "no".`);
+                  if (req === 'yes' && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(e.requestorEmail ?? '').trim())) errors.push(`accessRequests.${k}.requestorEmail must be a valid email when request is "yes".`);
                 }
               }
-            }
-            if ($null -ne $cfg.rbac) {
-              if ($cfg.rbac -isnot [System.Collections.IDictionary]) { throw "rbac must be an object when provided." }
-              foreach ($name in @("subscriptionAccess","resourceGroupAccess","resourceAccess")) {
-                if ($cfg.rbac.Contains($name) -and $null -ne $cfg.rbac[$name] -and $cfg.rbac[$name] -isnot [array]) {
-                  throw "rbac.$name must be an array when provided."
-                }
-              }
-            }
-          } catch {
-            $result.Status = "FAIL"
-            $result.Finding = $_.Exception.Message
-            $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "input-validation.json") -Encoding UTF8
-            throw
-          }
-          $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $reportDir "input-validation.json") -Encoding UTF8
-          Write-Host $result.Finding
+            } catch (err) { errors.push(`input.json could not be parsed: ${err.message}`); }
+            const result = errors.length
+              ? { Status: 'FAIL', Finding: errors.join(' ') }
+              : { Status: 'PASS', Finding: 'input.json passed JSON parsing and structure checks.' };
+            fs.writeFileSync(path.join(dir, 'input-validation.json'), JSON.stringify(result));
+            core.info(result.Finding);
+            if (errors.length) core.setFailed(result.Finding);
 
       - name: Install and run zizmor
         id: zizmor

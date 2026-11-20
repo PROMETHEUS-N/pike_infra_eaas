@@ -1,5 +1,16 @@
 # PIKE Deployment Workflow — deploy.yml
 
+> **Update — this document describes the previous workflow.** The current `deploy.yml` works like this:
+>
+> - **`input.json` holds only yes/no flags:** `environment` plus a `yes`/`no` for each resource type (`resourceTargets`) and for each access request type (`accessRequests`).
+> - **Values come from the GitHub Environment:** every job runs in the environment named by `input.json` (for example `dev`) and reads all values from that environment's variables and secrets. See [github-environment-variables.md](../github-environment-variables.md).
+> - **Names are built in the modules:** each Bicep module builds its resource names from naming tokens. See [resource-naming-standard.md](../resource-naming-standard.md).
+> - **Job flow:** `prechecks → plan (read input.json, build ordered plan) → context (Azure login, resource group name) → deploy (one job, walks the plan sequentially) → access-management (rbac job, pim job) → inventory (CSV, always)`.
+> - **Dynamic sequential plan:** the `plan` job lists only the resources set to `yes` plus their prerequisites, in dependency order. Example: only `storageAccount: "yes"` gives the plan `Resource Group → Storage Account`. Resources not in the plan do not appear in the run at all.
+> - **Prerequisites added automatically:** every resource needs the resource group; subnets and PostgreSQL need the VNet; VMs and the load balancer need the subnet; the Application Gateway needs its subnet. An auto-added prerequisite is created only if it does not exist (existing ones are not re-applied); the resource group is always applied because it is idempotent.
+> - **Failures:** when an entry fails, the entries that depend on it are skipped and independent entries continue. The run fails if anything failed or was blocked. The OIDC login is refreshed before each entry so long plans do not outlive the Azure CLI token.
+> - **Shared deploy action:** every deployment goes through `.github/actions/deploy-bicep`. It maps the variables to module parameters, validates them, then runs What-If and the deployment. No PowerShell scripts are used.
+
 **Branch:** dev  
 **Workflow:** .github/workflows/deploy.yml  
 **Purpose:** Explain the deployment workflow, PowerShell logic, input/template paths, parameter generation, What-If previews, and Azure deployments.

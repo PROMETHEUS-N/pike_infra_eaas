@@ -36,3 +36,6 @@ resource roleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 
 output roleAssignmentId string = roleAssignment.id
 output assignedResourceId string = targetStorageAccount.id
+
+output deployedResourceId string = roleAssignment.id
+output deployedResourceName string = roleAssignment.name
